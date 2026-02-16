@@ -751,11 +751,44 @@ def run_strategy():
             res_text = f"{liq_zones['resistance']:.2f}" if not np.isnan(liq_zones['resistance']) else "None"
             sup_text = f"{liq_zones['support']:.2f}" if not np.isnan(liq_zones['support']) else "None"
 
-            # 5. Trend validity check (Core: Trend reversed after entry, forbid TP/add)
+            # 5. 趋势有效性检查 + 核心修改：趋势不一致时强制平仓
             if trade_state.position_dir != "none":
                 trade_state.is_trend_valid = (current_trend == trade_state.trend_at_open)
                 if not trade_state.is_trend_valid:
-                    main_logger.warning(Fore.YELLOW + "⚠️ Trend reversed, lock current zone operations, wait for close signal")
+                    main_logger.warning(Fore.YELLOW + "⚠️ Trend reversed, lock current zone operations, force close position!")
+                    
+                    # ========== 核心修改：趋势不一致强制平仓 ==========
+                    pos_dir, pos_size, _ = get_position(SYMBOL)
+                    if pos_size > 0:  # 有持仓才平仓
+                        # 平多头仓：卖
+                        if pos_dir == "long":
+                            main_logger.info(Fore.RED + f"\n{'='*80}")
+                            main_logger.info(Fore.RED + "🔴 [Trend Reversal Force Close] Closing Long Position")
+                            main_logger.info(Fore.RED + f"Reason: Current trend ({current_trend}) != Entry trend ({trade_state.trend_at_open})")
+                            main_logger.info(Fore.RED + f"Close Quantity: {pos_size} | Current Price: {current_price:.2f}")
+                            main_logger.info(Fore.RED + f"{'='*80}\n")
+                            
+                            close_order = place_market_order(SYMBOL, Client.SIDE_SELL, pos_size)
+                            if close_order:
+                                signal_logger.info(f"[Force Close Long] Qty: {pos_size} @ {current_price:.2f}")
+                        # 平空头仓：买
+                        elif pos_dir == "short":
+                            main_logger.info(Fore.GREEN + f"\n{'='*80}")
+                            main_logger.info(Fore.GREEN + "🟢 [Trend Reversal Force Close] Closing Short Position")
+                            main_logger.info(Fore.GREEN + f"Reason: Current trend ({current_trend}) != Entry trend ({trade_state.trend_at_open})")
+                            main_logger.info(Fore.GREEN + f"Close Quantity: {pos_size} | Current Price: {current_price:.2f}")
+                            main_logger.info(Fore.GREEN + f"{'='*80}\n")
+                            
+                            close_order = place_market_order(SYMBOL, Client.SIDE_BUY, pos_size)
+                            if close_order:
+                                signal_logger.info(f"[Force Close Short] Qty: {pos_size} @ {current_price:.2f}")
+                        
+                        # 平仓后重置所有状态
+                        trade_state.reset()
+                        main_logger.info(Fore.YELLOW + "⏸️ Force close done, pause 60s to avoid misoperation")
+                        main_logger.info(Fore.CYAN + "="*60 + "\n")
+                        time.sleep(60)
+                        continue  # 平仓后跳过本轮剩余逻辑
 
             # Log output
             main_logger.info(Fore.CYAN + "="*60)
