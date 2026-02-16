@@ -84,9 +84,9 @@ MAX_ADD_TIMES = 1               # Max add times per trend (prevent heavy positio
 NEW_ZONE_THRESHOLD_PCT = 0.5    # New zone threshold (price difference ≥0.5% from last operated zone = new opportunity)
 STATE_RESET_DELAY = 1           # State reset delay (reset after bar confirmation to prevent misjudgment)
 
-# Binance Client Initialization
-client = Client(API_KEY, API_SECRET, testnet=False)
-main_logger.info(Fore.CYAN + "✅ Binance live trading client initialized")
+# Binance Client Initialization (with increased timeout)
+client = Client(API_KEY, API_SECRET, testnet=False, requests_params={'timeout': 30})
+main_logger.info(Fore.CYAN + "✅ Binance live trading client initialized (timeout=30s)")
 
 # ———————————————— [Core Addition] Full Lifecycle State Management Dataclass ————————————————
 @dataclass
@@ -181,7 +181,7 @@ def calculate_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
     tr3 = abs(low - close.shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr = pd.concat([tr1, tr2, tr2], axis=1).max(axis=1)
     atr = tr.rolling(window=period, min_periods=period).mean()
     return atr
 
@@ -657,36 +657,33 @@ def run_strategy():
     last_kline_time = 0
     kline_update_retries = 0
     MAX_KLINE_RETRIES = 3
+    RETRY_INTERVAL = 5  # Increased retry interval to 5 seconds to avoid rate limits
 
     while True:
         try:
-            # 1. Get kline data with retry logic
+            # 1. Get kline data with retry logic (simplified to avoid startTime issues)
             klines = None
             for retry in range(MAX_KLINE_RETRIES):
                 try:
-                    # If we have a previous kline time, fetch data after it to avoid duplicates
-                    if last_kline_time > 0:
-                        klines = client.futures_klines(
-                            symbol=SYMBOL,
-                            interval=INTERVAL,
-                            limit=LOOKBACK,
-                            startTime=last_kline_time + 1  # Fetch data after last kline time
-                        )
-                    else:
-                        klines = client.futures_klines(
-                            symbol=SYMBOL,
-                            interval=INTERVAL,
-                            limit=LOOKBACK
-                        )
-                    if klines:
+                    # Directly fetch latest data without startTime to avoid timestamp issues
+                    klines = client.futures_klines(
+                        symbol=SYMBOL,
+                        interval=INTERVAL,
+                        limit=LOOKBACK
+                    )
+                    if klines and len(klines) > 0:
+                        main_logger.info(Fore.CYAN + f"✅ Successfully fetched {len(klines)} klines (retry {retry+1})")
                         break
-                    main_logger.warning(Fore.YELLOW + f"⚠️ Kline fetch retry {retry+1}/{MAX_KLINE_RETRIES}")
-                    time.sleep(2)
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Kline fetch retry {retry+1}/{MAX_KLINE_RETRIES}: Empty response")
+                    time.sleep(RETRY_INTERVAL)
+                except BinanceAPIException as e:
+                    main_logger.error(Fore.RED + f"❌ Kline fetch failed (retry {retry+1}): Binance API error: {e}")
+                    time.sleep(RETRY_INTERVAL)
                 except Exception as e:
                     main_logger.error(Fore.RED + f"❌ Kline fetch failed (retry {retry+1}): {e}")
-                    time.sleep(2)
+                    time.sleep(RETRY_INTERVAL)
             
-            if not klines:
+            if not klines or len(klines) == 0:
                 main_logger.error(Fore.RED + "❌ Failed to fetch kline data after all retries, skipping this round")
                 time.sleep(30)
                 continue
