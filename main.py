@@ -135,7 +135,7 @@ class TradeState:
         self.initial_entry_price = entry_price
         self.trend_at_open = trend
         self.is_trend_valid = True
-        main_logger.info(Fore.GREEN + f"📝 New position state initialized | Dir:{pos_dir} | Size:{pos_size} | Entry:{entry_price:.2f}")
+        main_logger.info(Fore.GREEN + f"📝 New position state initialized | Dir:{pos_dir} | Size:{pos_size} | Entry:{entry_price:.2f} | Trend at open:{trend}")
         signal_logger.info(f"[State Init] {pos_dir} position | Size:{pos_size} | Entry:{entry_price:.2f} | Trend:{trend}")
 
     # Update Position State (Call after TP/Add/Close to sync latest position data)
@@ -181,7 +181,8 @@ def calculate_atr(data: pd.DataFrame, period: int = 14) -> pd.Series:
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
     tr3 = abs(low - close.shift(1))
-    tr = pd.concat([tr1, tr2, tr2], axis=1).max(axis=1)
+    # 修复：原代码此处错误使用tr2两次，改为tr3
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(window=period, min_periods=period).mean()
     return atr
 
@@ -288,26 +289,19 @@ def confirm_breakout(data: pd.DataFrame, zone_price: float, pos_dir: str) -> boo
         main_logger.info(Fore.BLUE + f"✅ Valid breakout confirmed | Zone Price:{zone_price:.2f} | Breakout Level:{breakout_level:.2f} | Confirm Bars:{BREAKOUT_CONFIRM_BARS}")
     return all_breakout
 
-# ———————————————— [New] Script Restart State Auto-Restore ————————————————
+# ———————————————— [修复核心] Script Restart State Auto-Restore ————————————————
 def restore_trade_state():
     """Automatically restore trading state from Binance on script start/restart to avoid state loss"""
     pos_dir, pos_size, entry_price = get_position(SYMBOL)
     if pos_dir != "none" and pos_size > 0:
-        # Has position, restore state
-        klines = client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=LOOKBACK)
-        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume','close_time', 'quote_vol', 'trades', 'taker_buy_base','taker_buy_quote', 'ignore'])
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        # 关键修复：根据仓位方向推断开仓时的趋势，而非重新计算当前趋势
+        # 多头仓位 → 开仓趋势为1，空头仓位 → 开仓趋势为-1
+        trend_at_open = 1 if pos_dir == "long" else -1
         
-        # Calculate current trend
-        df['atr_200'] = calculate_atr(df, period=ATR_PERIOD)
-        _, l1_trend = l1_proximal_filter(df['close'], df['atr_200'], ATR_MULT, MU)
-        current_trend = int(l1_trend[-1])
-
-        # Restore state
-        trade_state.init_new_position(pos_dir, pos_size, entry_price, current_trend)
-        main_logger.info(Fore.GREEN + f"🔄 Restart state restored | Position:{pos_dir} {pos_size} | Avg Price:{entry_price:.2f}")
-        signal_logger.info(f"[Restart Restore] {pos_dir} position | Size:{pos_size} | Avg Price:{entry_price:.2f}")
+        # Restore state (使用推导出的开仓趋势，而非当前趋势)
+        trade_state.init_new_position(pos_dir, pos_size, entry_price, trend_at_open)
+        main_logger.info(Fore.GREEN + f"🔄 Restart state restored | Position:{pos_dir} {pos_size} | Avg Price:{entry_price:.2f} | Trend at open:{trend_at_open}")
+        signal_logger.info(f"[Restart Restore] {pos_dir} position | Size:{pos_size} | Avg Price:{entry_price:.2f} | Trend at open:{trend_at_open}")
     else:
         # No position, reset state
         trade_state.reset()
@@ -751,13 +745,16 @@ def run_strategy():
             res_text = f"{liq_zones['resistance']:.2f}" if not np.isnan(liq_zones['resistance']) else "None"
             sup_text = f"{liq_zones['support']:.2f}" if not np.isnan(liq_zones['support']) else "None"
 
-            # 5. 趋势有效性检查 + 核心修改：趋势不一致时强制平仓
+            # 5. 趋势有效性检查 + 核心修复：趋势不一致时强制平仓（优先级最高）
             if trade_state.position_dir != "none":
+                # 重新校验趋势有效性（确保实时更新）
                 trade_state.is_trend_valid = (current_trend == trade_state.trend_at_open)
+                main_logger.info(Fore.CYAN + f"🧮 Trend validity check | Current trend:{current_trend} | Trend at open:{trade_state.trend_at_open} | Valid:{trade_state.is_trend_valid}")
+                
                 if not trade_state.is_trend_valid:
                     main_logger.warning(Fore.YELLOW + "⚠️ Trend reversed, lock current zone operations, force close position!")
                     
-                    # ========== 核心修改：趋势不一致强制平仓 ==========
+                    # ========== 核心逻辑：趋势不一致强制平仓 ==========
                     pos_dir, pos_size, _ = get_position(SYMBOL)
                     if pos_size > 0:  # 有持仓才平仓
                         # 平多头仓：卖
@@ -771,6 +768,8 @@ def run_strategy():
                             close_order = place_market_order(SYMBOL, Client.SIDE_SELL, pos_size)
                             if close_order:
                                 signal_logger.info(f"[Force Close Long] Qty: {pos_size} @ {current_price:.2f}")
+                            else:
+                                main_logger.error(Fore.RED + "❌ Force close long failed! Manual intervention required!")
                         # 平空头仓：买
                         elif pos_dir == "short":
                             main_logger.info(Fore.GREEN + f"\n{'='*80}")
@@ -782,10 +781,12 @@ def run_strategy():
                             close_order = place_market_order(SYMBOL, Client.SIDE_BUY, pos_size)
                             if close_order:
                                 signal_logger.info(f"[Force Close Short] Qty: {pos_size} @ {current_price:.2f}")
+                            else:
+                                main_logger.error(Fore.RED + "❌ Force close short failed! Manual intervention required!")
                         
-                        # 平仓后重置所有状态
+                        # 无论平仓是否成功，都重置状态（避免死循环）
                         trade_state.reset()
-                        main_logger.info(Fore.YELLOW + "⏸️ Force close done, pause 60s to avoid misoperation")
+                        main_logger.info(Fore.YELLOW + "⏸️ Force close process done, pause 60s to avoid misoperation")
                         main_logger.info(Fore.CYAN + "="*60 + "\n")
                         time.sleep(60)
                         continue  # 平仓后跳过本轮剩余逻辑
@@ -851,7 +852,7 @@ def run_strategy():
                         current_pos, current_pos_amt, _ = get_position(SYMBOL)
 
                 # Open new long position (force entry if signal triggered and quantity valid)
-                if adjusted_qty > 0:
+                if adjusted_qty > 0 and current_pos != 'long':
                     main_logger.info(Fore.GREEN + f"🚀 [Open Long] Buy {adjusted_qty} {SYMBOL}")
                     open_order = place_market_order(SYMBOL, Client.SIDE_BUY, adjusted_qty)
                     if open_order:
@@ -862,7 +863,10 @@ def run_strategy():
                     else:
                         main_logger.error(Fore.RED + "❌ Long entry failed, check API permissions/balance")
                 else:
-                    main_logger.error(Fore.RED + f"❌ Calculated entry quantity {adjusted_qty} is invalid, cannot open position")
+                    if current_pos == 'long':
+                        main_logger.warning(Fore.YELLOW + "⚠️ Already holding long position, skip open long")
+                    else:
+                        main_logger.error(Fore.RED + f"❌ Calculated entry quantity {adjusted_qty} is invalid, cannot open position")
 
             # Short entry execution
             elif signal_open_short:
@@ -885,7 +889,7 @@ def run_strategy():
                         current_pos, current_pos_amt, _ = get_position(SYMBOL)
 
                 # Open new short position (force entry if signal triggered and quantity valid)
-                if adjusted_qty > 0:
+                if adjusted_qty > 0 and current_pos != 'short':
                     main_logger.info(Fore.RED + f"🚀 [Open Short] Sell {adjusted_qty} {SYMBOL}")
                     open_order = place_market_order(SYMBOL, Client.SIDE_SELL, adjusted_qty)
                     if open_order:
@@ -896,7 +900,10 @@ def run_strategy():
                     else:
                         main_logger.error(Fore.RED + "❌ Short entry failed, check API permissions/balance")
                 else:
-                    main_logger.error(Fore.RED + f"❌ Calculated entry quantity {adjusted_qty} is invalid, cannot open position")
+                    if current_pos == 'short':
+                        main_logger.warning(Fore.YELLOW + "⚠️ Already holding short position, skip open short")
+                    else:
+                        main_logger.error(Fore.RED + f"❌ Calculated entry quantity {adjusted_qty} is invalid, cannot open position")
 
             # No signal log
             else:
