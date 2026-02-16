@@ -302,7 +302,7 @@ def restore_trade_state():
         # Calculate current trend
         df['atr_200'] = calculate_atr(df, period=ATR_PERIOD)
         _, l1_trend = l1_proximal_filter(df['close'], df['atr_200'], ATR_MULT, MU)
-        current_trend = l1_trend[-1]
+        current_trend = int(l1_trend[-1])
 
         # Restore state
         trade_state.init_new_position(pos_dir, pos_size, entry_price, current_trend)
@@ -655,15 +655,42 @@ def run_strategy():
     price_precision, qty_precision = get_symbol_precision(SYMBOL)
     restore_trade_state() # Auto restore state on restart
     last_kline_time = 0
+    kline_update_retries = 0
+    MAX_KLINE_RETRIES = 3
 
     while True:
         try:
-            # 1. Get kline data
-            klines = client.futures_klines(
-                symbol=SYMBOL,
-                interval=INTERVAL,
-                limit=LOOKBACK
-            )
+            # 1. Get kline data with retry logic
+            klines = None
+            for retry in range(MAX_KLINE_RETRIES):
+                try:
+                    # If we have a previous kline time, fetch data after it to avoid duplicates
+                    if last_kline_time > 0:
+                        klines = client.futures_klines(
+                            symbol=SYMBOL,
+                            interval=INTERVAL,
+                            limit=LOOKBACK,
+                            startTime=last_kline_time + 1  # Fetch data after last kline time
+                        )
+                    else:
+                        klines = client.futures_klines(
+                            symbol=SYMBOL,
+                            interval=INTERVAL,
+                            limit=LOOKBACK
+                        )
+                    if klines:
+                        break
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Kline fetch retry {retry+1}/{MAX_KLINE_RETRIES}")
+                    time.sleep(2)
+                except Exception as e:
+                    main_logger.error(Fore.RED + f"❌ Kline fetch failed (retry {retry+1}): {e}")
+                    time.sleep(2)
+            
+            if not klines:
+                main_logger.error(Fore.RED + "❌ Failed to fetch kline data after all retries, skipping this round")
+                time.sleep(30)
+                continue
+
             df = pd.DataFrame(klines, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_vol', 'trades', 'taker_buy_base',
@@ -672,17 +699,25 @@ def run_strategy():
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-            # 2. New kline check (Enhanced with debug log)
-            current_kline_time = df['timestamp'].iloc[-1]
+            # 2. New kline check (Enhanced with retry and debug log)
+            current_kline_time = int(df['timestamp'].iloc[-1])
             current_kline_dt = pd.to_datetime(current_kline_time, unit='ms')
             last_kline_dt = pd.to_datetime(last_kline_time, unit='ms') if last_kline_time !=0 else "None"
             
             main_logger.info(Fore.CYAN + f"🕒 Kline time check | Current kline time: {current_kline_dt} | Previous kline time: {last_kline_dt}")
             
             if current_kline_time == last_kline_time:
-                main_logger.warning(Fore.YELLOW + "⚠️ Kline not updated, waiting 30 seconds")
-                time.sleep(30)
-                continue
+                kline_update_retries += 1
+                if kline_update_retries >= MAX_KLINE_RETRIES:
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Kline not updated after {MAX_KLINE_RETRIES} retries, resetting last_kline_time to force refresh")
+                    last_kline_time = 0  # Reset to force full data fetch next time
+                    kline_update_retries = 0
+                else:
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Kline not updated, waiting 30 seconds (retry {kline_update_retries}/{MAX_KLINE_RETRIES})")
+                    time.sleep(30)
+                    continue
+            else:
+                kline_update_retries = 0  # Reset retries on successful update
             
             last_kline_time = current_kline_time
             kline_time = pd.to_datetime(current_kline_time, unit='ms')
@@ -694,7 +729,12 @@ def run_strategy():
                 time.sleep(30)
                 continue
 
-            # 3. Core indicator calculation
+            # 3. Core indicator calculation with data validation
+            if len(df) < ATR_PERIOD + 1:
+                main_logger.error(Fore.RED + f"❌ Insufficient kline data: {len(df)} bars, need at least {ATR_PERIOD + 1} for ATR calculation")
+                time.sleep(30)
+                continue
+
             df['atr_200'] = calculate_atr(df, period=ATR_PERIOD)
             
             # Check ATR validity
