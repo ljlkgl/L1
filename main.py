@@ -694,10 +694,12 @@ def run_strategy():
     main_logger.info(Fore.CYAN + "="*80)
 
     # 初始化：启用对冲模式、设置杠杆
-    setup_hedge_mode(SYMBOL)
+    try:
+        setup_hedge_mode(SYMBOL)
+    except Exception as e:
+        main_logger.error(Fore.RED + f"❌ Failed to initialize strategy: {e}")
     setup_leverage_and_margin(SYMBOL, LEVERAGE, MARGIN_TYPE)
     restore_trade_state()
-    
     last_kline_time = 0
     kline_update_retries = 0
     MAX_KLINE_RETRIES = 3
