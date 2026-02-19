@@ -657,9 +657,6 @@ def run_strategy():
     except BinanceAPIException as e:
         if "No need to change position mode" in str(e):
             main_logger.info(Fore.CYAN + "ℹ️ Already in hedge mode")
-        else:
-            main_logger.error(Fore.RED + f"❌ Failed to set hedge mode: {e}")
-            return
 
     try:
         client.futures_change_margin_type(symbol=FUTURES_SYMBOL, marginType=MARGIN_TYPE)
