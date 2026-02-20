@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import json
 import logging
 import pandas as pd
 import numpy as np
@@ -10,25 +9,25 @@ from binance.exceptions import BinanceAPIException, BinanceOrderException
 from dotenv import load_dotenv
 from datetime import datetime
 from colorama import init, Fore, Style
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Tuple, List, Any
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Tuple
 
 sys.stdout.reconfigure(encoding='utf-8')
 
 # Initialize color output
 init(autoreset=True)
 
-# ------------------------------ Logging System ------------------------------
+# ———————————————— Logging System ————————————————
 def setup_logger():
-    main_logger = logging.getLogger('Gainz_Main')
+    main_logger = logging.getLogger('VWT_Main')
     main_logger.setLevel(logging.DEBUG)
     main_logger.propagate = False
-    signal_logger = logging.getLogger('Gainz_Signal')
+    signal_logger = logging.getLogger('VWT_Signal')
     signal_logger.setLevel(logging.INFO)
     signal_logger.propagate = False
 
     if not main_logger.handlers:
-        file_handler = logging.FileHandler(f'gainz_full_log_{datetime.now().strftime("%Y%m%d")}.log', encoding='utf-8')
+        file_handler = logging.FileHandler(f'vwt_full_log_{datetime.now().strftime("%Y%m%d")}.log', encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
@@ -40,7 +39,7 @@ def setup_logger():
         main_logger.addHandler(console_handler)
 
     if not signal_logger.handlers:
-        signal_file_handler = logging.FileHandler(f'gainz_signal_log_{datetime.now().strftime("%Y%m%d")}.log', encoding='utf-8')
+        signal_file_handler = logging.FileHandler(f'vwt_signal_log_{datetime.now().strftime("%Y%m%d")}.log', encoding='utf-8')
         signal_file_handler.setLevel(logging.INFO)
         signal_formatter = logging.Formatter('%(asctime)s | %(message)s')
         signal_file_handler.setFormatter(signal_formatter)
@@ -50,93 +49,112 @@ def setup_logger():
 
 main_logger, signal_logger = setup_logger()
 
-# ------------------------------ Configuration ------------------------------
+# ———————————————— Full Configuration ————————————————
 load_dotenv()
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
-# Trading pairs
-SPOT_SYMBOL = "ETHUSDT"          # Symbol for fetching klines (signal source)
-FUTURES_SYMBOL = "ETHUSDC"       # Actual trading symbol on futures
+# ========== 分离现货数据源和合约交易标的 ==========
+SPOT_SYMBOL = "ETHUSDT"          # 用于获取K线计算信号的现货交易对
+FUTURES_SYMBOL = "ETHUSDC"        # 实际执行交易的永续合约交易对
 
-# Timeframe for main signal calculation
 INTERVAL = Client.KLINE_INTERVAL_15MINUTE
-LOOKBACK = 600                    # Number of klines to fetch
+LOOKBACK = 600
 
-# ========== GainzAlgo Indicator Parameters ==========
-# Pivot and momentum
-GA_PIVOT_LENGTH = 5               # length for pivot highs/lows
-GA_MOMENTUM_THRESHOLD_BASE = 0.01 # base momentum threshold (%)
-GA_PRE_MOMENTUM_FACTOR_BASE = 0.5 # factor for get-ready signals (not used)
+# ========== VWT 趋势参数（与 TradingView 指标默认值一致） ==========
+VWMA_LENGTH = 34                  # VWMA 周期
+VWT_ATR_MULT = 1.5                # ATR 乘数
 
-# TP/SL in points
-GA_TP_POINTS = 10
-GA_SL_POINTS = 10
-GA_MIN_SIGNAL_DISTANCE = 5        # minimum bars between signals
-
-# Filters (enable/disable)
-GA_USE_MOMENTUM_FILTER = True
-GA_USE_TREND_FILTER = False       # set to True to enable multi-timeframe trend filter (requires extra kline requests)
-GA_HIGHER_TF_CHOICE = "5M"        # only used if trend filter enabled
-GA_USE_LOWER_TF_FILTER = False
-GA_LOWER_TF_CHOICE = "5M"
-GA_USE_VOLUME_FILTER = False
-GA_USE_BREAKOUT_FILTER = False
-GA_SHOW_GET_READY = False         # ignored
-
-# Repeated signal restriction
-GA_RESTRICT_REPEATED_SIGNALS = True
-GA_RESTRICT_TREND_TF_CHOICE = "5M"  # timeframe used to check trend for repeated signals
-
-# Volume filter parameters
-GA_VOLUME_LONG_PERIOD = 50
-GA_VOLUME_SHORT_PERIOD = 5
-
-# Breakout filter parameters
-GA_BREAKOUT_PERIOD = 5
-
-# ========== Risk Management ==========
+# Leverage & Risk Management
 LEVERAGE = 20
 MARGIN_TYPE = "ISOLATED"
-RISK_PERCENTAGE = 50               # % of USDC balance to risk per entry
+RISK_PERCENTAGE = 50
+ADD_RISK_PCT = 20
 
-# State persistence file
-STATE_FILE = "gainz_state.json"
+# Stop Loss Config
+STOP_LOSS_PCT = 1.5
+ENABLE_STOP_LOSS = False
+
+# Liquidity Sweep Core Parameters
+LIQ_SWEEP_LENGTH = 8
+LIQ_PARTIAL_PROFIT_RATIO = 0.5
+BREAKOUT_CONFIRM_BARS = 2
+BREAKOUT_THRESHOLD_PCT = 0.1
+
+# State Management Core Config
+MAX_ADD_TIMES = 1
+NEW_ZONE_THRESHOLD_PCT = 0.5
+STATE_RESET_DELAY = 1
+
+# Trailing Stop Configuration
+ENABLE_TRAILING_STOP = True
+TRAILING_ATR_MULT = 1.1
 
 # Binance Client Initialization
 client = Client(API_KEY, API_SECRET, testnet=False, requests_params={'timeout': 30})
 main_logger.info(Fore.CYAN + "✅ Binance live trading client initialized (timeout=30s)")
-main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} {INTERVAL} | Trading on: {FUTURES_SYMBOL}")
-main_logger.info(Fore.CYAN + f"🎯 Strategy: GainzAlgo Smart Money Structure (Full Implementation with Exchange TP/SL)")
+main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} spot klines | Trading on: {FUTURES_SYMBOL} futures")
+main_logger.info(Fore.CYAN + f"📈 Trend indicator: VWT (VWMA + ATR channel) with VWMA length={VWMA_LENGTH}, ATR mult={VWT_ATR_MULT}")
 
-# ------------------------------ State Management ------------------------------
+# ———————————————— SideState and TradeState (unchanged) ————————————————
 @dataclass
 class SideState:
     position_size: float = 0.0
     entry_price: float = 0.0
-    # The following fields are not critical for operation after TP/SL are placed on exchange,
-    # but kept for logging and potential future use.
-    signal_bar_low: float = 0.0
-    signal_bar_high: float = 0.0
+    initial_entry_price: float = 0.0
+    trend_at_open: int = 0          # 开仓时的 VWT 趋势：1=看涨，-1=看跌
+    is_trend_valid: bool = False
+    last_operated_zone_price: float = 0.0
+    has_partial_tp_in_zone: bool = False
+    has_added_in_zone: bool = False
+    total_add_times: int = 0
+    last_add_price: float = 0.0
     highest_since_entry: float = 0.0
     lowest_since_entry: float = 0.0
 
     def reset(self):
         self.position_size = 0.0
         self.entry_price = 0.0
-        self.signal_bar_low = 0.0
-        self.signal_bar_high = 0.0
+        self.initial_entry_price = 0.0
+        self.trend_at_open = 0
+        self.is_trend_valid = False
+        self.last_operated_zone_price = 0.0
+        self.has_partial_tp_in_zone = False
+        self.has_added_in_zone = False
+        self.total_add_times = 0
+        self.last_add_price = 0.0
         self.highest_since_entry = 0.0
         self.lowest_since_entry = 0.0
 
-    def init_new_position(self, pos_size: float, entry_price: float, bar_low: float, bar_high: float):
+    def init_new_position(self, pos_size: float, entry_price: float, trend: int):
         self.reset()
         self.position_size = pos_size
         self.entry_price = entry_price
-        self.signal_bar_low = bar_low
-        self.signal_bar_high = bar_high
+        self.initial_entry_price = entry_price
+        self.trend_at_open = trend
+        self.is_trend_valid = True
         self.highest_since_entry = entry_price
         self.lowest_since_entry = entry_price
+
+    def update_position(self, pos_size: float, entry_price: float):
+        self.position_size = pos_size
+        self.entry_price = entry_price
+
+    def is_new_liquidity_zone(self, current_zone_price: float, pos_dir: str) -> bool:
+        if self.last_operated_zone_price == 0:
+            return True
+        price_diff_pct = abs(current_zone_price - self.last_operated_zone_price) / self.last_operated_zone_price * 100
+        if pos_dir == "long":
+            is_new = (current_zone_price > self.last_operated_zone_price) and (price_diff_pct >= NEW_ZONE_THRESHOLD_PCT)
+        elif pos_dir == "short":
+            is_new = (current_zone_price < self.last_operated_zone_price) and (price_diff_pct >= NEW_ZONE_THRESHOLD_PCT)
+        else:
+            is_new = False
+        if is_new:
+            self.has_partial_tp_in_zone = False
+            self.has_added_in_zone = False
+            main_logger.info(Fore.CYAN + f"🎯 New liquidity zone detected | Price:{current_zone_price:.2f} | Diff:{price_diff_pct:.2f}%")
+        return is_new
 
 @dataclass
 class TradeState:
@@ -158,125 +176,177 @@ class TradeState:
 
 trade_state = TradeState()
 
-# Global signal restriction state (persisted)
-@dataclass
-class SignalHistory:
-    last_signal_bar: int = -GA_MIN_SIGNAL_DISTANCE - 1
-    last_signal_direction: str = "Neutral"   # "Buy", "Sell", "Neutral"
-    last_signal_trend: int = 0                # trend value from restrict TF at last signal
+# ———————————————— 辅助函数：RMA-ATR（与 TradingView 一致） ————————————————
+def calculate_atr_rma(data: pd.DataFrame, period: int) -> pd.Series:
+    high = data['high']
+    low = data['low']
+    close = data['close']
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    return atr
 
-signal_history = SignalHistory()
+# ———————————————— VWT 趋势计算（核心信号） ————————————————
+def calculate_vwt_trend(data: pd.DataFrame, vwma_length: int, atr_mult: float) -> tuple[int, int, float, float, float]:
+    """
+    计算 VWT 趋势及通道
+    返回: (current_trend, prev_trend, vwma_basis, upper_band, lower_band)
+    trend: 1=看涨（收盘价>上轨），-1=看跌（收盘价<下轨），0=中性（通道内）
+    """
+    close = data['close']
+    volume = data['volume']
+    
+    # VWMA = (price * volume) 的滚动和 / volume 的滚动和
+    vwma = (close * volume).rolling(window=vwma_length).sum() / volume.rolling(window=vwma_length).sum()
+    
+    # 用 RMA 计算 ATR，周期与 VWMA 相同
+    atr_vwt = calculate_atr_rma(data, vwma_length)
+    
+    upper_band = vwma + atr_vwt * atr_mult
+    lower_band = vwma - atr_vwt * atr_mult
+    
+    # 确定当前趋势
+    current_trend = 0
+    if close.iloc[-1] > upper_band.iloc[-1]:
+        current_trend = 1
+    elif close.iloc[-1] < lower_band.iloc[-1]:
+        current_trend = -1
+    
+    # 前一趋势（使用上根K线的收盘价比较）
+    prev_trend = 0
+    if len(close) > 1:
+        if close.iloc[-2] > upper_band.iloc[-2]:
+            prev_trend = 1
+        elif close.iloc[-2] < lower_band.iloc[-2]:
+            prev_trend = -1
+    
+    return current_trend, prev_trend, vwma.iloc[-1], upper_band.iloc[-1], lower_band.iloc[-1]
 
-# ------------------------------ State Persistence ------------------------------
-def save_state():
-    """Save signal history and trade state to file."""
-    state = {
-        'signal_history': {
-            'last_signal_bar': signal_history.last_signal_bar,
-            'last_signal_direction': signal_history.last_signal_direction,
-            'last_signal_trend': signal_history.last_signal_trend
-        },
-        'trade_state': {
-            'long': asdict(trade_state.long_state),
-            'short': asdict(trade_state.short_state)
-        }
-    }
+# ———————————————— 流动性区域检测（不变） ————————————————
+def detect_liquidity_zones(data: pd.DataFrame, lookback_len: int = 8) -> dict:
+    df = data.copy()
+    closed_df = df.iloc[:-1].copy()
+    nearest_resistance = np.nan
+    nearest_support = np.nan
+
+    if len(closed_df) < lookback_len * 2 + 1:
+        return {'resistance': nearest_resistance, 'support': nearest_support}
+
+    closed_df['is_pivot_high'] = closed_df['high'] == closed_df['high'].rolling(window=lookback_len*2+1, center=True).max()
+    closed_df['is_pivot_low'] = closed_df['low'] == closed_df['low'].rolling(window=lookback_len*2+1, center=True).min()
+
+    pivot_highs = closed_df[closed_df['is_pivot_high']]['high']
+    pivot_lows = closed_df[closed_df['is_pivot_low']]['low']
+
+    current_price = df['close'].iloc[-1]
+    if not pivot_highs.empty:
+        valid_resistances = pivot_highs[pivot_highs > current_price]
+        if not valid_resistances.empty:
+            nearest_resistance = valid_resistances.iloc[-1]
+    if not pivot_lows.empty:
+        valid_supports = pivot_lows[pivot_lows < current_price]
+        if not valid_supports.empty:
+            nearest_support = valid_supports.iloc[-1]
+
+    return {'resistance': nearest_resistance, 'support': nearest_support}
+
+def confirm_breakout(data: pd.DataFrame, zone_price: float, pos_dir: str) -> bool:
+    if len(data) < BREAKOUT_CONFIRM_BARS:
+        return False
+    recent_bars = data.iloc[-(BREAKOUT_CONFIRM_BARS+1):-1]
+    if pos_dir == "long":
+        breakout_level = zone_price * (1 + BREAKOUT_THRESHOLD_PCT / 100)
+        all_breakout = all(recent_bars['close'] > breakout_level)
+    elif pos_dir == "short":
+        breakout_level = zone_price * (1 - BREAKOUT_THRESHOLD_PCT / 100)
+        all_breakout = all(recent_bars['close'] < breakout_level)
+    else:
+        all_breakout = False
+    if all_breakout:
+        main_logger.info(Fore.BLUE + f"✅ Valid breakout confirmed | Zone Price:{zone_price:.2f} | Breakout Level:{breakout_level:.2f} | Confirm Bars:{BREAKOUT_CONFIRM_BARS}")
+    return all_breakout
+
+# ———————————————— 交易辅助函数（不变，但使用 FUTURES_SYMBOL） ————————————————
+def setup_hedge_mode(symbol: str):
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
-        main_logger.debug("✅ State saved to file")
-    except Exception as e:
-        main_logger.error(f"❌ Failed to save state: {e}")
+        client.futures_change_position_mode(dualSidePosition=True)
+        main_logger.info(Fore.GREEN + "✅ Successfully switched to HEDGE MODE (dual side position)")
+        position_mode = client.futures_get_position_mode()
+        main_logger.info(Fore.CYAN + f"🔍 Current position mode: {position_mode}")
+    except BinanceAPIException as e:
+        if "No need to change position mode" in str(e):
+            main_logger.info(Fore.CYAN + "ℹ️ Already in HEDGE MODE")
+        else:
+            main_logger.error(Fore.RED + f"❌ Failed to set hedge mode: {e}")
+            raise
 
-def load_state():
-    """Load signal history and trade state from file."""
-    global signal_history, trade_state
-    if not os.path.exists(STATE_FILE):
-        main_logger.info("ℹ️ No state file found, starting fresh")
-        return
+def setup_leverage_and_margin(symbol: str, leverage: int, margin_type: str):
     try:
-        with open(STATE_FILE, 'r') as f:
-            state = json.load(f)
-        # Load signal history
-        sh = state.get('signal_history', {})
-        signal_history.last_signal_bar = sh.get('last_signal_bar', -GA_MIN_SIGNAL_DISTANCE-1)
-        signal_history.last_signal_direction = sh.get('last_signal_direction', 'Neutral')
-        signal_history.last_signal_trend = sh.get('last_signal_trend', 0)
-
-        # Load trade state (only for logging, will be overridden by exchange later)
-        ts = state.get('trade_state', {})
-        long_dict = ts.get('long', {})
-        trade_state.long_state = SideState(**long_dict)
-        short_dict = ts.get('short', {})
-        trade_state.short_state = SideState(**short_dict)
-
-        main_logger.info("✅ State loaded from file")
-    except Exception as e:
-        main_logger.error(f"❌ Failed to load state: {e}")
-
-# ------------------------------ Helper Functions ------------------------------
-def get_tick_size(symbol: str) -> float:
-    """Get minimum price tick size for the symbol."""
+        client.futures_change_margin_type(symbol=symbol, marginType=margin_type)
+        main_logger.info(Fore.CYAN + f"🔧 Margin mode set: {'Isolated' if margin_type == 'ISOLATED' else 'Cross'}")
+    except BinanceAPIException as e:
+        if "No need to change margin type" not in str(e):
+            main_logger.warning(Fore.YELLOW + f"⚠️ Margin mode note: {e}")
     try:
-        info = client.futures_exchange_info()
-        for s in info['symbols']:
-            if s['symbol'] == symbol:
-                for f in s['filters']:
-                    if f['filterType'] == 'PRICE_FILTER':
-                        return float(f['tickSize'])
-        return 0.01
+        client.futures_change_leverage(symbol=symbol, leverage=leverage)
+        main_logger.info(Fore.CYAN + f"🔧 Leverage set: {leverage}x")
     except Exception as e:
-        main_logger.error(Fore.RED + f"❌ Failed to get tick size: {e}")
-        return 0.01
+        main_logger.error(Fore.RED + f"❌ Leverage setup failed: {e}")
+        raise
 
 def get_position(symbol: str) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Get current long and short positions."""
     long_info = {'size': 0.0, 'entry_price': 0.0}
     short_info = {'size': 0.0, 'entry_price': 0.0}
     try:
         positions = client.futures_position_information(symbol=symbol)
         for pos in positions:
             if pos['symbol'] == symbol:
-                side = pos['positionSide']
+                position_side = pos['positionSide']
                 amt = float(pos['positionAmt'])
-                entry = float(pos['entryPrice'])
-                if side == 'LONG' and amt > 0:
+                entry_price = float(pos['entryPrice'])
+                if position_side == 'LONG' and amt > 0:
                     long_info['size'] = amt
-                    long_info['entry_price'] = entry
-                elif side == 'SHORT' and amt > 0:
+                    long_info['entry_price'] = entry_price
+                    main_logger.info(Fore.CYAN + f"📈 Long position: {amt} | Entry price: {entry_price}")
+                elif position_side == 'SHORT' and amt > 0:
                     short_info['size'] = amt
-                    short_info['entry_price'] = entry
+                    short_info['entry_price'] = entry_price
+                    main_logger.info(Fore.CYAN + f"📉 Short position: {amt} | Entry price: {entry_price}")
+        if long_info['size'] == 0 and short_info['size'] == 0:
+            main_logger.info(Fore.CYAN + "📊 No current positions (both sides)")
         return long_info, short_info
     except Exception as e:
         main_logger.error(Fore.RED + f"❌ Failed to get position: {e}")
         return long_info, short_info
 
 def get_usdc_balance() -> float:
-    """Get available USDC balance in futures account."""
     try:
         balance = client.futures_account_balance()
         for asset in balance:
             if asset['asset'] == 'USDC':
-                return float(asset['availableBalance'])
+                available_balance = float(asset['availableBalance'])
+                main_logger.info(Fore.CYAN + f"💰 USDC available balance: {available_balance}")
+                return available_balance
+        main_logger.error(Fore.RED + "❌ USDC balance not found")
         return 0.0
     except Exception as e:
         main_logger.error(Fore.RED + f"❌ Failed to get USDC balance: {e}")
         return 0.0
 
 def get_symbol_precision(symbol: str) -> tuple[int, int]:
-    """Get price and quantity precision for the symbol."""
     try:
         info = client.futures_exchange_info()
-        for s in info['symbols']:
-            if s['symbol'] == symbol:
-                return int(s['pricePrecision']), int(s['quantityPrecision'])
+        for symbol_info in info['symbols']:
+            if symbol_info['symbol'] == symbol:
+                return int(symbol_info['pricePrecision']), int(symbol_info['quantityPrecision'])
         return 2, 3
     except Exception as e:
         main_logger.error(Fore.RED + f"❌ Failed to get precision: {e}")
         return 2, 3
 
 def calculate_position_size(symbol: str, usdc_balance: float, risk_pct: float, leverage: int, current_price: float) -> float:
-    """Calculate position size based on risk % and leverage."""
     try:
         info = client.futures_exchange_info()
         symbol_info = None
@@ -288,12 +358,8 @@ def calculate_position_size(symbol: str, usdc_balance: float, risk_pct: float, l
             main_logger.error(Fore.RED + f"❌ Trading pair information for {symbol} not found")
             return 0.0
         qty_precision = int(symbol_info['quantityPrecision'])
-        # Find minQty filter
-        min_qty = 0.0
-        for f in symbol_info['filters']:
-            if f['filterType'] == 'LOT_SIZE':
-                min_qty = float(f['minQty'])
-                break
+        min_qty = float(symbol_info['filters'][1]['minQty'])
+        main_logger.info(Fore.YELLOW + f"📏 Trading pair parameters | Minimum quantity:{min_qty} | Quantity precision:{qty_precision}")
     except Exception as e:
         main_logger.error(Fore.RED + f"❌ Failed to get symbol precision: {e}")
         return 0.0
@@ -302,21 +368,23 @@ def calculate_position_size(symbol: str, usdc_balance: float, risk_pct: float, l
     notional_value = risk_amount * leverage
     position_size = notional_value / current_price
     adjusted_size = round(position_size, qty_precision)
+    main_logger.info(Fore.YELLOW + f"📏 Position calculation details | Risk amount:{risk_amount} | Notional value:{notional_value} | Raw position:{position_size} | Adjusted:{adjusted_size}")
     if adjusted_size < min_qty:
+        main_logger.warning(Fore.YELLOW + f"⚠️ Adjusted position {adjusted_size} is less than minimum quantity {min_qty}, force set to {min_qty}")
         adjusted_size = min_qty
     if adjusted_size <= 0:
+        main_logger.error(Fore.RED + f"❌ Calculated position {adjusted_size} is invalid (<=0)")
         return min_qty
     return adjusted_size
 
-def place_market_order(symbol: str, side: str, quantity: float, position_side: str) -> Optional[dict]:
-    """Place a market order."""
+def place_market_order(symbol: str, side: str, quantity: float, position_side: str) -> dict:
     try:
         _, qty_precision = get_symbol_precision(symbol)
         quantity = round(quantity, qty_precision)
         order = client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type=Client.ORDER_TYPE_MARKET,
+            symbol=symbol, 
+            side=side, 
+            type=Client.ORDER_TYPE_MARKET, 
             quantity=quantity,
             positionSide=position_side
         )
@@ -327,356 +395,225 @@ def place_market_order(symbol: str, side: str, quantity: float, position_side: s
         main_logger.error(Fore.RED + f"❌ [Order Failed] {e} | Side: {side} | PositionSide: {position_side} | Quantity: {quantity}")
         return None
 
-def cancel_all_orders(symbol: str):
-    """Cancel all open orders for the symbol."""
-    try:
-        result = client.futures_cancel_all_open_orders(symbol=symbol)
-        main_logger.info(Fore.YELLOW + f"✅ Cancelled all open orders for {symbol}")
-        return result
-    except Exception as e:
-        main_logger.error(Fore.RED + f"❌ Failed to cancel orders: {e}")
-        return None
-
-def place_tp_sl_orders(symbol: str, position_side: str, quantity: float,
-                       tp_price: float, sl_price: float) -> Tuple[bool, Optional[dict], Optional[dict]]:
-    """
-    Place take-profit and stop-loss orders on the exchange.
-    Returns (success, tp_order, sl_order)
-    """
-    price_precision, qty_precision = get_symbol_precision(symbol)
-    quantity_rounded = round(quantity, qty_precision)
-
-    # Determine order side
-    if position_side == 'LONG':
-        order_side = Client.SIDE_SELL
-    else:  # SHORT
-        order_side = Client.SIDE_BUY
-
-    tp_order = None
-    sl_order = None
-    success = True
-
-    # Place take-profit market order
-    try:
-        tp_order = client.futures_create_order(
-            symbol=symbol,
-            side=order_side,
-            type='TAKE_PROFIT_MARKET',
-            quantity=quantity_rounded,
-            stopPrice=round(tp_price, price_precision),
-            positionSide=position_side,
-            workingType='MARK_PRICE'   # Use mark price to avoid manipulation
-        )
-        main_logger.info(Fore.GREEN + f"✅ TP order placed for {position_side} at {tp_price:.2f}")
-    except Exception as e:
-        main_logger.error(Fore.RED + f"❌ Failed to place TP order: {e}")
-        success = False
-
-    # Place stop-loss market order
-    try:
-        sl_order = client.futures_create_order(
-            symbol=symbol,
-            side=order_side,
-            type='STOP_MARKET',
-            quantity=quantity_rounded,
-            stopPrice=round(sl_price, price_precision),
-            positionSide=position_side,
-            workingType='MARK_PRICE'
-        )
-        main_logger.info(Fore.GREEN + f"✅ SL order placed for {position_side} at {sl_price:.2f}")
-    except Exception as e:
-        main_logger.error(Fore.RED + f"❌ Failed to place SL order: {e}")
-        success = False
-
-    return success, tp_order, sl_order
-
-def restore_trade_state_from_exchange():
-    """Restore trade state from actual positions on exchange."""
-    long_info, short_info = get_position(FUTURES_SYMBOL)
-    # Update long state
+def check_stop_loss(symbol: str, current_price: float) -> Tuple[bool, str]:
+    long_info, short_info = get_position(symbol)
+    if not ENABLE_STOP_LOSS:
+        return False, "none"
     if long_info['size'] > 0:
-        trade_state.long_state.position_size = long_info['size']
-        trade_state.long_state.entry_price = long_info['entry_price']
+        loss_pct = (long_info['entry_price'] - current_price) / long_info['entry_price'] * 100
+        if loss_pct >= STOP_LOSS_PCT:
+            warn_msg = f"⚠️ [Long Stop Loss Triggered] Entry: {long_info['entry_price']:.2f}, Current: {current_price:.2f}, Loss: {loss_pct:.2f}%"
+            main_logger.warning(Fore.YELLOW + warn_msg)
+            signal_logger.warning(warn_msg)
+            return True, "long"
+    if short_info['size'] > 0:
+        loss_pct = (current_price - short_info['entry_price']) / short_info['entry_price'] * 100
+        if loss_pct >= STOP_LOSS_PCT:
+            warn_msg = f"⚠️ [Short Stop Loss Triggered] Entry: {short_info['entry_price']:.2f}, Current: {current_price:.2f}, Loss: {loss_pct:.2f}%"
+            main_logger.warning(Fore.YELLOW + warn_msg)
+            signal_logger.warning(warn_msg)
+            return True, "short"
+    return False, "none"
+
+def restore_trade_state():
+    long_info, short_info = get_position(FUTURES_SYMBOL)
+    if long_info['size'] > 0:
+        trade_state.long_state.init_new_position(
+            pos_size=long_info['size'],
+            entry_price=long_info['entry_price'],
+            trend=1  # 恢复时默认趋势为1（需根据实际情况调整，但无法获取历史趋势，只能假设有效）
+        )
         trade_state.long_state.highest_since_entry = long_info['entry_price']
         trade_state.long_state.lowest_since_entry = long_info['entry_price']
-        main_logger.info(Fore.GREEN + f"🔄 Restored long state | Size:{long_info['size']} | Entry:{long_info['entry_price']:.2f}")
-    else:
-        trade_state.long_state.reset()
-    # Update short state
+        main_logger.info(Fore.GREEN + f"🔄 Restored long state | Size:{long_info['size']} | Entry:{long_info['entry_price']:.2f} | Trend at open:1")
     if short_info['size'] > 0:
-        trade_state.short_state.position_size = short_info['size']
-        trade_state.short_state.entry_price = short_info['entry_price']
+        trade_state.short_state.init_new_position(
+            pos_size=short_info['size'],
+            entry_price=short_info['entry_price'],
+            trend=-1
+        )
         trade_state.short_state.highest_since_entry = short_info['entry_price']
         trade_state.short_state.lowest_since_entry = short_info['entry_price']
-        main_logger.info(Fore.GREEN + f"🔄 Restored short state | Size:{short_info['size']} | Entry:{short_info['entry_price']:.2f}")
-    else:
-        trade_state.short_state.reset()
-    # Log any existing orders (optional)
-    try:
-        open_orders = client.futures_get_open_orders(symbol=FUTURES_SYMBOL)
-        main_logger.info(Fore.CYAN + f"📋 Found {len(open_orders)} open orders")
-    except Exception as e:
-        main_logger.error(f"Failed to get open orders: {e}")
+        main_logger.info(Fore.GREEN + f"🔄 Restored short state | Size:{short_info['size']} | Entry:{short_info['entry_price']:.2f} | Trend at open:-1")
+    if long_info['size'] == 0 and short_info['size'] == 0:
+        trade_state.reset_all()
+        main_logger.info(Fore.CYAN + "🔄 No positions, state initialized")
 
-# ------------------------------ Technical Indicator Functions ------------------------------
-def calculate_atr_rma(data: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculate ATR using RMA (exponential moving average with alpha=1/period)."""
-    high = data['high']
-    low = data['low']
-    close = data['close']
-    tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    return atr
+def check_partial_take_profit(symbol: str, current_price: float, liq_zones: dict):
+    long_info, short_info = get_position(symbol)
+    qty_precision = get_symbol_precision(symbol)[1]
+    min_qty = float(client.futures_exchange_info()['symbols'][0]['filters'][1]['minQty'])
 
-def pivot_high(high: pd.Series, length: int) -> pd.Series:
-    """Return boolean series where high is a pivot high (highest in left+right length bars)."""
-    pivots = pd.Series(False, index=high.index)
-    for i in range(length, len(high)-length):
-        if high.iloc[i] == high.iloc[i-length:i+length+1].max():
-            pivots.iloc[i] = True
-    return pivots
+    if long_info['size'] > 0 and trade_state.long_state.is_trend_valid and not np.isnan(liq_zones['resistance']):
+        zone_price = liq_zones['resistance']
+        if trade_state.long_state.is_new_liquidity_zone(zone_price, "long"):
+            if (current_price >= zone_price 
+                and not trade_state.long_state.has_partial_tp_in_zone 
+                and long_info['size'] > min_qty):
+                sell_qty = round(long_info['size'] * LIQ_PARTIAL_PROFIT_RATIO, qty_precision)
+                sell_qty = max(sell_qty, min_qty)
+                main_logger.info(Fore.MAGENTA + "\n" + "="*80)
+                main_logger.info(Fore.MAGENTA + f"🎯 [Long Partial TP] Hit resistance: {zone_price:.2f}")
+                main_logger.info(Fore.MAGENTA + f"Action: Close {LIQ_PARTIAL_PROFIT_RATIO*100}% long position | Qty: {sell_qty}")
+                main_logger.info(Fore.MAGENTA + "="*80 + "\n")
+                order = place_market_order(symbol, Client.SIDE_SELL, sell_qty, 'LONG')
+                if order:
+                    trade_state.long_state.has_partial_tp_in_zone = True
+                    trade_state.long_state.last_operated_zone_price = zone_price
+                    new_long, _ = get_position(symbol)
+                    trade_state.long_state.update_position(new_long['size'], new_long['entry_price'])
+                    signal_logger.info(f"[Long Partial TP Done] Close {sell_qty} @ {current_price} | Resistance: {zone_price} | Remaining: {new_long['size']}")
 
-def pivot_low(low: pd.Series, length: int) -> pd.Series:
-    """Return boolean series where low is a pivot low."""
-    pivots = pd.Series(False, index=low.index)
-    for i in range(length, len(low)-length):
-        if low.iloc[i] == low.iloc[i-length:i+length+1].min():
-            pivots.iloc[i] = True
-    return pivots
+    if short_info['size'] > 0 and trade_state.short_state.is_trend_valid and not np.isnan(liq_zones['support']):
+        zone_price = liq_zones['support']
+        if trade_state.short_state.is_new_liquidity_zone(zone_price, "short"):
+            if (current_price <= zone_price 
+                and not trade_state.short_state.has_partial_tp_in_zone 
+                and short_info['size'] > min_qty):
+                buy_qty = round(short_info['size'] * LIQ_PARTIAL_PROFIT_RATIO, qty_precision)
+                buy_qty = max(buy_qty, min_qty)
+                main_logger.info(Fore.MAGENTA + "\n" + "="*80)
+                main_logger.info(Fore.MAGENTA + f"🎯 [Short Partial TP] Hit support: {zone_price:.2f}")
+                main_logger.info(Fore.MAGENTA + f"Action: Close {LIQ_PARTIAL_PROFIT_RATIO*100}% short position | Qty: {buy_qty}")
+                main_logger.info(Fore.MAGENTA + "="*80 + "\n")
+                order = place_market_order(symbol, Client.SIDE_BUY, buy_qty, 'SHORT')
+                if order:
+                    trade_state.short_state.has_partial_tp_in_zone = True
+                    trade_state.short_state.last_operated_zone_price = zone_price
+                    _, new_short = get_position(symbol)
+                    trade_state.short_state.update_position(new_short['size'], new_short['entry_price'])
+                    signal_logger.info(f"[Short Partial TP Done] Close {buy_qty} @ {current_price} | Support: {zone_price} | Remaining: {new_short['size']}")
 
-def compute_multi_tf_trend(symbol: str, tf_choice: str, current_close: float) -> int:
+def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, current_trend: int):
+    long_info, short_info = get_position(symbol)
+    usdc_balance = get_usdc_balance()
+    qty_precision = get_symbol_precision(symbol)[1]
+
+    if (long_info['size'] > 0 
+        and trade_state.long_state.is_trend_valid 
+        and current_trend == 1 
+        and trade_state.long_state.total_add_times < MAX_ADD_TIMES
+        and not np.isnan(liq_zones['resistance'])):
+        zone_price = liq_zones['resistance']
+        if trade_state.long_state.is_new_liquidity_zone(zone_price, "long"):
+            klines_data = client.get_klines(symbol=SPOT_SYMBOL, interval=INTERVAL, limit=LOOKBACK)
+            df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume','close_time', 'quote_vol', 'trades', 'taker_buy_base','taker_buy_quote', 'ignore'])
+            for col in ['open', 'high', 'low', 'close']:
+                df_kline[col] = pd.to_numeric(df_kline[col], errors='coerce')
+            if (confirm_breakout(df_kline, zone_price, "long")
+                and not trade_state.long_state.has_added_in_zone
+                and trade_state.long_state.has_partial_tp_in_zone):
+                add_qty = calculate_position_size(symbol, usdc_balance, ADD_RISK_PCT, LEVERAGE, current_price)
+                if add_qty <= 0:
+                    main_logger.warning(Fore.YELLOW + "⚠️ Long add qty insufficient, skip add")
+                    return
+                main_logger.info(Fore.BLUE + "\n" + "="*80)
+                main_logger.info(Fore.BLUE + f"🚀 [Long Breakout Add] Valid breakout of resistance: {zone_price:.2f}")
+                main_logger.info(Fore.BLUE + f"Trend confirmed: VWT remains long | Add count: {trade_state.long_state.total_add_times+1}/{MAX_ADD_TIMES}")
+                main_logger.info(Fore.BLUE + f"Action: Add long | Qty: {add_qty}")
+                main_logger.info(Fore.BLUE + "="*80 + "\n")
+                order = place_market_order(symbol, Client.SIDE_BUY, add_qty, 'LONG')
+                if order:
+                    trade_state.long_state.has_added_in_zone = True
+                    trade_state.long_state.total_add_times += 1
+                    trade_state.long_state.last_add_price = current_price
+                    trade_state.long_state.last_operated_zone_price = zone_price
+                    new_long, _ = get_position(symbol)
+                    trade_state.long_state.update_position(new_long['size'], new_long['entry_price'])
+                    signal_logger.info(f"[Long Add Done] Add {add_qty} @ {current_price} | Breakout: {zone_price} | Total adds: {trade_state.long_state.total_add_times} | Total pos: {new_long['size']}")
+
+    if (short_info['size'] > 0 
+        and trade_state.short_state.is_trend_valid 
+        and current_trend == -1 
+        and trade_state.short_state.total_add_times < MAX_ADD_TIMES
+        and not np.isnan(liq_zones['support'])):
+        zone_price = liq_zones['support']
+        if trade_state.short_state.is_new_liquidity_zone(zone_price, "short"):
+            klines_data = client.get_klines(symbol=SPOT_SYMBOL, interval=INTERVAL, limit=LOOKBACK)
+            df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume','close_time', 'quote_vol', 'trades', 'taker_buy_base','taker_buy_quote', 'ignore'])
+            for col in ['open', 'high', 'low', 'close']:
+                df_kline[col] = pd.to_numeric(df_kline[col], errors='coerce')
+            if (confirm_breakout(df_kline, zone_price, "short")
+                and not trade_state.short_state.has_added_in_zone
+                and trade_state.short_state.has_partial_tp_in_zone):
+                add_qty = calculate_position_size(symbol, usdc_balance, ADD_RISK_PCT, LEVERAGE, current_price)
+                if add_qty <= 0:
+                    main_logger.warning(Fore.YELLOW + "⚠️ Short add qty insufficient, skip add")
+                    return
+                main_logger.info(Fore.BLUE + "\n" + "="*80)
+                main_logger.info(Fore.BLUE + f"🚀 [Short Breakdown Add] Valid breakdown of support: {zone_price:.2f}")
+                main_logger.info(Fore.BLUE + f"Trend confirmed: VWT remains short | Add count: {trade_state.short_state.total_add_times+1}/{MAX_ADD_TIMES}")
+                main_logger.info(Fore.BLUE + f"Action: Add short | Qty: {add_qty}")
+                main_logger.info(Fore.BLUE + "="*80 + "\n")
+                order = place_market_order(symbol, Client.SIDE_SELL, add_qty, 'SHORT')
+                if order:
+                    trade_state.short_state.has_added_in_zone = True
+                    trade_state.short_state.total_add_times += 1
+                    trade_state.short_state.last_add_price = current_price
+                    trade_state.short_state.last_operated_zone_price = zone_price
+                    _, new_short = get_position(symbol)
+                    trade_state.short_state.update_position(new_short['size'], new_short['entry_price'])
+                    signal_logger.info(f"[Short Add Done] Add {add_qty} @ {current_price} | Breakdown: {zone_price} | Total adds: {trade_state.short_state.total_add_times} | Total pos: {new_short['size']}")
+
+def force_close_invalid_trend_positions(current_trend: int, current_price: float):
     """
-    Compute trend for a given timeframe based on EMA20 and VWAP.
-    Returns: 1 (bullish), -1 (bearish), 0 (neutral/undefined)
+    强制平仓与当前 VWT 趋势反向的仓位
+    规则：如果开仓趋势为1，当前趋势为-1，则平多；如果开仓趋势为-1，当前趋势为1，则平空。
+    趋势为0时不平仓（视为中性，不强制）
     """
-    tf_map = {
-        "1M": Client.KLINE_INTERVAL_1MINUTE,
-        "5M": Client.KLINE_INTERVAL_5MINUTE,
-        "15M": Client.KLINE_INTERVAL_15MINUTE,
-        "30M": Client.KLINE_INTERVAL_30MINUTE,
-        "1H": Client.KLINE_INTERVAL_1HOUR,
-        "4H": Client.KLINE_INTERVAL_4HOUR,
-        "D": Client.KLINE_INTERVAL_1DAY
-    }
-    interval = tf_map.get(tf_choice)
-    if not interval:
-        return 0
+    long_info, short_info = get_position(FUTURES_SYMBOL)
+    if long_info['size'] > 0:
+        # 检查多头是否应平仓：开仓时趋势应为1，当前趋势为-1则无效
+        trade_state.long_state.is_trend_valid = not (current_trend == -1 and trade_state.long_state.trend_at_open == 1)
+        main_logger.info(Fore.CYAN + f"🧮 Long trend validity | Current VWT trend:{current_trend} | Open trend:{trade_state.long_state.trend_at_open} | Valid:{trade_state.long_state.is_trend_valid}")
+        if not trade_state.long_state.is_trend_valid:
+            main_logger.warning(Fore.YELLOW + "⚠️ Long trend invalid (VWT turned bearish), force close long position!")
+            main_logger.info(Fore.RED + f"\n{'='*80}")
+            main_logger.info(Fore.RED + "🔴 [Force Close Long] VWT trend reversed")
+            main_logger.info(Fore.RED + f"Reason: Current VWT trend ({current_trend}) vs open trend ({trade_state.long_state.trend_at_open})")
+            main_logger.info(Fore.RED + f"Close Quantity: {long_info['size']} | Current Price: {current_price:.2f}")
+            main_logger.info(Fore.RED + f"{'='*80}\n")
+            close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
+            if close_order:
+                signal_logger.info(f"[Force Close Long] Qty: {long_info['size']} @ {current_price:.2f}")
+            else:
+                main_logger.error(Fore.RED + "❌ Force close long failed! Manual intervention required!")
+            trade_state.reset_side("long")
+            main_logger.info(Fore.YELLOW + "⏸️ Long force close done")
+    if short_info['size'] > 0:
+        trade_state.short_state.is_trend_valid = not (current_trend == 1 and trade_state.short_state.trend_at_open == -1)
+        main_logger.info(Fore.CYAN + f"🧮 Short trend validity | Current VWT trend:{current_trend} | Open trend:{trade_state.short_state.trend_at_open} | Valid:{trade_state.short_state.is_trend_valid}")
+        if not trade_state.short_state.is_trend_valid:
+            main_logger.warning(Fore.YELLOW + "⚠️ Short trend invalid (VWT turned bullish), force close short position!")
+            main_logger.info(Fore.GREEN + f"\n{'='*80}")
+            main_logger.info(Fore.GREEN + "🟢 [Force Close Short] VWT trend reversed")
+            main_logger.info(Fore.GREEN + f"Reason: Current VWT trend ({current_trend}) vs open trend ({trade_state.short_state.trend_at_open})")
+            main_logger.info(Fore.GREEN + f"Close Quantity: {short_info['size']} | Current Price: {current_price:.2f}")
+            main_logger.info(Fore.GREEN + f"{'='*80}\n")
+            close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
+            if close_order:
+                signal_logger.info(f"[Force Close Short] Qty: {short_info['size']} @ {current_price:.2f}")
+            else:
+                main_logger.error(Fore.RED + "❌ Force close short failed! Manual intervention required!")
+            trade_state.reset_side("short")
+            main_logger.info(Fore.YELLOW + "⏸️ Short force close done")
 
-    try:
-        # Fetch enough klines to compute EMA20 (at least 20)
-        limit = 50
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        if len(klines) < 20:
-            return 0
-
-        df = pd.DataFrame(klines, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_vol', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignore'
-        ])
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        close_series = df['close']
-        # EMA20
-        ema20 = close_series.ewm(span=20, adjust=False).mean().iloc[-1]
-        # VWAP (using typical price = (high+low+close)/3)
-        typical_price = (pd.to_numeric(df['high']) + pd.to_numeric(df['low']) + pd.to_numeric(df['close'])) / 3
-        volume = pd.to_numeric(df['volume'])
-        vwap = (typical_price * volume).sum() / volume.sum() if volume.sum() != 0 else close_series.iloc[-1]
-
-        if current_close > ema20 and current_close > vwap:
-            return 1
-        elif current_close < ema20 and current_close < vwap:
-            return -1
-        else:
-            return 0
-    except Exception as e:
-        main_logger.error(Fore.RED + f"❌ Failed to compute multi-tf trend for {tf_choice}: {e}")
-        return 0
-
-# ------------------------------ GainzAlgo Signal Detection ------------------------------
-def check_gainz_signal(data: pd.DataFrame,
-                       pivot_len: int,
-                       momo_base: float,
-                       tp_points: int,
-                       sl_points: int,
-                       use_momo: bool,
-                       use_volume: bool,
-                       use_breakout: bool,
-                       vol_long: int,
-                       vol_short: int,
-                       breakout_period: int,
-                       tick_size: float,
-                       use_trend_filter: bool,
-                       higher_tf: str,
-                       use_lower_tf_filter: bool,
-                       lower_tf: str,
-                       restrict_repeated: bool,
-                       restrict_tf: str,
-                       current_tick_close: float,
-                       last_signal_dir: str,
-                       last_signal_trend_val: int) -> Tuple[bool, bool, float, float, float, float, bool]:
-    """
-    Main signal detection function.
-    Returns: (buy_signal, sell_signal, buy_sl, buy_tp, sell_sl, sell_tp, signal_allowed_by_restrict)
-    """
-    if len(data) < pivot_len * 2 + 2:
-        return False, False, np.nan, np.nan, np.nan, np.nan, False
-
-    df = data.copy()
-    close = df['close']
-    high = df['high']
-    low = df['low']
-    open_ = df['open']
-    volume = df['volume']
-
-    # --- Dynamic momentum threshold based on ATR ---
-    atr = calculate_atr_rma(df, 14)
-    volatility_factor = atr / close
-    momentum_threshold = momo_base * (1 + volatility_factor * 2)
-    price_change = ((close - close.shift(1)) / close.shift(1)) * 100
-
-    # --- Volume condition ---
-    vol_avg_long = volume.rolling(window=vol_long).mean()
-    vol_avg_short = volume.rolling(window=vol_short).mean()
-    vol_condition = (volume > vol_avg_long) & (vol_avg_short.diff() > 0)
-
-    # --- Breakout condition ---
-    highest_breakout = high.rolling(window=breakout_period).max().shift(1)
-    lowest_breakout = low.rolling(window=breakout_period).min().shift(1)
-
-    # --- Pivot points and structure ---
-    pivot_highs = pivot_high(high, pivot_len)
-    pivot_lows = pivot_low(low, pivot_len)
-
-    # Create series for last pivot high/low values (forward filled)
-    df['pivot_high_val'] = np.where(pivot_highs, high, np.nan)
-    df['pivot_low_val'] = np.where(pivot_lows, low, np.nan)
-    df['last_high'] = df['pivot_high_val'].ffill()
-    df['last_low'] = df['pivot_low_val'].ffill()
-    df['last_high_prev'] = df['last_high'].shift(1)
-    df['last_low_prev'] = df['last_low'].shift(1)
-
-    # CHoCH and BOS conditions
-    choch_sell = (low < df['last_high']) & (low.shift(1) >= df['last_high'].shift(1)) & (close < open_)
-    choch_buy = (high > df['last_low']) & (high.shift(1) <= df['last_low'].shift(1)) & (close > open_)
-    bos_sell = (low < df['last_low_prev']) & (close < open_)
-    bos_buy = (high > df['last_high_prev']) & (close > open_)
-
-    struct_sell = choch_sell | bos_sell
-    struct_buy = choch_buy | bos_buy
-
-    # --- Momentum early signal ---
-    momo_sell = price_change < -momentum_threshold if use_momo else True
-    momo_buy = price_change > momentum_threshold if use_momo else True
-
-    # --- Multi-timeframe trend filters (if enabled) ---
-    if use_trend_filter or use_lower_tf_filter or restrict_repeated:
-        # For simplicity, compute only restrict TF trend for repeated signal restriction.
-        restrict_trend = compute_multi_tf_trend(SPOT_SYMBOL, restrict_tf, current_tick_close) if restrict_repeated else 0
-    else:
-        restrict_trend = 0
-
-    # Higher TF trend filter
-    if use_trend_filter:
-        higher_trend = compute_multi_tf_trend(SPOT_SYMBOL, higher_tf, current_tick_close)
-        trend_ok_buy = (higher_trend == 1)
-        trend_ok_sell = (higher_trend == -1)
-    else:
-        trend_ok_buy = True
-        trend_ok_sell = True
-
-    # Lower TF filter
-    if use_lower_tf_filter:
-        lower_trend = compute_multi_tf_trend(SPOT_SYMBOL, lower_tf, current_tick_close)
-        lower_ok_buy = (lower_trend != -1) and (lower_trend != 0)
-        lower_ok_sell = (lower_trend != 1) and (lower_trend != 0)
-    else:
-        lower_ok_buy = True
-        lower_ok_sell = True
-
-    # --- Repeated signal restriction ---
-    signal_allowed = True
-    if restrict_repeated:
-        if last_signal_dir == "Buy":
-            signal_allowed = (restrict_trend != 1)
-        elif last_signal_dir == "Sell":
-            signal_allowed = (restrict_trend != -1)
-        # else last_signal_dir == "Neutral" -> allowed
-
-    # --- Combine all filters for the latest bar ---
-    sell_condition = struct_sell & momo_sell & trend_ok_sell & lower_ok_sell
-    buy_condition = struct_buy & momo_buy & trend_ok_buy & lower_ok_buy
-
-    if use_volume:
-        sell_condition &= vol_condition
-        buy_condition &= vol_condition
-    if use_breakout:
-        sell_condition &= (close < lowest_breakout)
-        buy_condition &= (close > highest_breakout)
-
-    # Take last bar's signal
-    sell_signal = sell_condition.iloc[-1] if not sell_condition.empty else False
-    buy_signal = buy_condition.iloc[-1] if not buy_condition.empty else False
-
-    # Avoid conflicting signals
-    if buy_signal and sell_signal:
-        buy_signal = sell_signal = False
-
-    # Calculate SL/TP prices based on signal bar's low/high
-    current_bar = df.iloc[-1]
-    bar_low = current_bar['low']
-    bar_high = current_bar['high']
-
-    buy_sl = bar_low - sl_points * tick_size if buy_signal else np.nan
-    buy_tp = bar_high + tp_points * tick_size if buy_signal else np.nan
-    sell_sl = bar_high + sl_points * tick_size if sell_signal else np.nan
-    sell_tp = bar_low - tp_points * tick_size if sell_signal else np.nan
-
-    return buy_signal, sell_signal, buy_sl, buy_tp, sell_sl, sell_tp, signal_allowed
-
-# ------------------------------ Main Strategy Loop ------------------------------
+# ———————————————— 主策略循环（VWT 信号） ————————————————
 def run_strategy():
-    global signal_history
-
     main_logger.info(Fore.CYAN + "="*80)
-    main_logger.info(Fore.CYAN + "🚀 GainzAlgo Smart Money Structure Strategy (Full Implementation with Exchange TP/SL)")
-    main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} {INTERVAL} | Trading on: {FUTURES_SYMBOL}")
-    main_logger.info(Fore.CYAN + f"⚙️  Pivot Len={GA_PIVOT_LENGTH}, Momo Base={GA_MOMENTUM_THRESHOLD_BASE}%, TP={GA_TP_POINTS}, SL={GA_SL_POINTS}")
-    main_logger.info(Fore.CYAN + f"🔧 Filters: Momo={GA_USE_MOMENTUM_FILTER}, Trend={GA_USE_TREND_FILTER}, LowerTF={GA_USE_LOWER_TF_FILTER}, Vol={GA_USE_VOLUME_FILTER}, Breakout={GA_USE_BREAKOUT_FILTER}")
-    main_logger.info(Fore.CYAN + f"💰 Risk: Leverage={LEVERAGE}x, EntryRisk={RISK_PERCENTAGE}%")
+    main_logger.info(Fore.CYAN + "🚀 VWT Trend Strategy (霓虹发光指标) Started")
+    main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} spot klines | Trading on: {FUTURES_SYMBOL} futures")
+    main_logger.info(Fore.CYAN + f"⚙️  VWT Params: VWMA Length={VWMA_LENGTH} | ATR Multiplier={VWT_ATR_MULT}")
+    main_logger.info(Fore.CYAN + f"💰  Risk Mgmt: Leverage={LEVERAGE}x | Initial Entry={RISK_PERCENTAGE}% | Add Ratio={ADD_RISK_PCT}%")
+    main_logger.info(Fore.CYAN + f"🛡️  Trailing Stop: Enabled={ENABLE_TRAILING_STOP} | ATR Mult={TRAILING_ATR_MULT}")
     main_logger.info(Fore.CYAN + "="*80)
 
-    # Setup hedge mode and leverage
     try:
-        client.futures_change_position_mode(dualSidePosition=True)
-        main_logger.info(Fore.GREEN + "✅ Hedge mode enabled")
-    except BinanceAPIException as e:
-        if "No need to change position mode" in str(e):
-            main_logger.info(Fore.CYAN + "ℹ️ Already in hedge mode")
-
-    try:
-        client.futures_change_margin_type(symbol=FUTURES_SYMBOL, marginType=MARGIN_TYPE)
-    except BinanceAPIException as e:
-        if "No need to change margin type" not in str(e):
-            main_logger.warning(Fore.YELLOW + f"⚠️ Margin type change: {e}")
-
-    try:
-        client.futures_change_leverage(symbol=FUTURES_SYMBOL, leverage=LEVERAGE)
-        main_logger.info(Fore.GREEN + f"✅ Leverage set to {LEVERAGE}x")
+        setup_hedge_mode(FUTURES_SYMBOL)
     except Exception as e:
-        main_logger.error(Fore.RED + f"❌ Leverage setup failed: {e}")
-        return
-
-    # Load persisted state and sync with exchange
-    load_state()
-    restore_trade_state_from_exchange()
-
-    tick_size = get_tick_size(FUTURES_SYMBOL)
-
+        main_logger.error(Fore.RED + f"❌ Failed to initialize strategy: {e}")
+    setup_leverage_and_margin(FUTURES_SYMBOL, LEVERAGE, MARGIN_TYPE)
+    restore_trade_state()
     last_kline_time = 0
     kline_update_retries = 0
     MAX_KLINE_RETRIES = 3
@@ -684,20 +621,29 @@ def run_strategy():
 
     while True:
         try:
-            # 1. Fetch spot klines
+            # 1. 获取现货K线数据
             klines = None
             for retry in range(MAX_KLINE_RETRIES):
                 try:
-                    klines = client.get_klines(symbol=SPOT_SYMBOL, interval=INTERVAL, limit=LOOKBACK)
+                    klines = client.get_klines(
+                        symbol=SPOT_SYMBOL,
+                        interval=INTERVAL,
+                        limit=LOOKBACK
+                    )
                     if klines and len(klines) > 0:
+                        main_logger.info(Fore.CYAN + f"✅ Successfully fetched {len(klines)} spot klines (retry {retry+1})")
                         break
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Spot kline fetch retry {retry+1}/{MAX_KLINE_RETRIES}: Empty response")
+                    time.sleep(RETRY_INTERVAL)
+                except BinanceAPIException as e:
+                    main_logger.error(Fore.RED + f"❌ Spot kline fetch failed (retry {retry+1}): Binance API error: {e}")
                     time.sleep(RETRY_INTERVAL)
                 except Exception as e:
-                    main_logger.error(Fore.RED + f"❌ Kline fetch error (retry {retry+1}): {e}")
+                    main_logger.error(Fore.RED + f"❌ Spot kline fetch failed (retry {retry+1}): {e}")
                     time.sleep(RETRY_INTERVAL)
-
-            if not klines:
-                main_logger.error("❌ No kline data, skipping cycle")
+            
+            if not klines or len(klines) == 0:
+                main_logger.error(Fore.RED + "❌ Failed to fetch spot kline data after all retries, skipping this round")
                 time.sleep(30)
                 continue
 
@@ -706,140 +652,158 @@ def run_strategy():
                 'close_time', 'quote_vol', 'trades', 'taker_buy_base',
                 'taker_buy_quote', 'ignore'
             ])
-            for col in ['open', 'high', 'low', 'close', 'volume']:
+            for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-            # 2. Check if new kline closed
+            # 2. 检查新K线
             current_kline_time = int(df['timestamp'].iloc[-1])
+            current_kline_dt = pd.to_datetime(current_kline_time, unit='ms')
+            last_kline_dt = pd.to_datetime(last_kline_time, unit='ms') if last_kline_time !=0 else "None"
+            
+            main_logger.info(Fore.CYAN + f"🕒 Spot kline time check | Current: {current_kline_dt} | Previous: {last_kline_dt}")
+            
             if current_kline_time == last_kline_time:
                 kline_update_retries += 1
                 if kline_update_retries >= MAX_KLINE_RETRIES:
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Spot kline not updated, resetting last_kline_time")
                     last_kline_time = 0
                     kline_update_retries = 0
                 else:
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Spot kline not updated, waiting 30s (retry {kline_update_retries}/{MAX_KLINE_RETRIES})")
                     time.sleep(30)
                     continue
             else:
                 kline_update_retries = 0
-
+            
             last_kline_time = current_kline_time
-            current_price = df['close'].iloc[-1]
+            kline_time = pd.to_datetime(current_kline_time, unit='ms')
+            current_price_spot = df['close'].iloc[-1]
 
-            # 3. Detect GainzAlgo signals
-            buy_signal, sell_signal, buy_sl, buy_tp, sell_sl, sell_tp, signal_allowed = check_gainz_signal(
-                df,
-                GA_PIVOT_LENGTH,
-                GA_MOMENTUM_THRESHOLD_BASE,
-                GA_TP_POINTS,
-                GA_SL_POINTS,
-                GA_USE_MOMENTUM_FILTER,
-                GA_USE_VOLUME_FILTER,
-                GA_USE_BREAKOUT_FILTER,
-                GA_VOLUME_LONG_PERIOD,
-                GA_VOLUME_SHORT_PERIOD,
-                GA_BREAKOUT_PERIOD,
-                tick_size,
-                GA_USE_TREND_FILTER,
-                GA_HIGHER_TF_CHOICE,
-                GA_USE_LOWER_TF_FILTER,
-                GA_LOWER_TF_CHOICE,
-                GA_RESTRICT_REPEATED_SIGNALS,
-                GA_RESTRICT_TREND_TF_CHOICE,
-                current_price,
-                signal_history.last_signal_direction,
-                signal_history.last_signal_trend
-            )
+            if pd.isna(current_price_spot):
+                main_logger.error(Fore.RED + "❌ Current spot price is NaN, skip this round")
+                time.sleep(30)
+                continue
 
-            # 4. Get current positions (sync with exchange)
+            # 3. 计算 VWT 趋势和通道
+            if len(df) < VWMA_LENGTH + 1:
+                main_logger.error(Fore.RED + f"❌ Insufficient spot kline data: {len(df)} < {VWMA_LENGTH + 1}")
+                time.sleep(30)
+                continue
+
+            current_trend, prev_trend, vwma_val, upper_band, lower_band = calculate_vwt_trend(df, VWMA_LENGTH, VWT_ATR_MULT)
+
+            # 4. 检测流动性区域
+            liq_zones = detect_liquidity_zones(df, lookback_len=LIQ_SWEEP_LENGTH)
+            res_text = f"{liq_zones['resistance']:.2f}" if not np.isnan(liq_zones['resistance']) else "None"
+            sup_text = f"{liq_zones['support']:.2f}" if not np.isnan(liq_zones['support']) else "None"
+
+            # 5. 趋势不一致强制平仓（基于 VWT）
+            force_close_invalid_trend_positions(current_trend, current_price_spot)
+
+            # 获取合约当前仓位
             long_info, short_info = get_position(FUTURES_SYMBOL)
-            # Update local state if positions changed due to external TP/SL hits
-            if long_info['size'] == 0 and trade_state.long_state.position_size > 0:
-                main_logger.info(Fore.YELLOW + "📉 Long position closed (likely by TP/SL)")
-                trade_state.long_state.reset()
-            if short_info['size'] == 0 and trade_state.short_state.position_size > 0:
-                main_logger.info(Fore.YELLOW + "📈 Short position closed (likely by TP/SL)")
-                trade_state.short_state.reset()
 
-            # 5. Logging
+            # 日志输出
             main_logger.info(Fore.CYAN + "="*60)
-            main_logger.info(Fore.CYAN + f"🕐 Time: {pd.to_datetime(current_kline_time, unit='ms')} | Price: {current_price:.2f}")
-            main_logger.info(Fore.CYAN + f"📊 Signals: Buy={buy_signal} | Sell={sell_signal} | Allowed={signal_allowed}")
-            main_logger.info(Fore.CYAN + f"📈 Long: {long_info['size']} @ {long_info['entry_price']:.2f} | Local: {trade_state.long_state.position_size}")
-            main_logger.info(Fore.CYAN + f"📉 Short: {short_info['size']} @ {short_info['entry_price']:.2f} | Local: {trade_state.short_state.position_size}")
+            main_logger.info(Fore.CYAN + f"🕐 Spot kline close time: {kline_time} | Spot close: {current_price_spot:.2f}")
+            main_logger.info(Fore.CYAN + f"📊 VWT: basis={vwma_val:.2f} | upper={upper_band:.2f} | lower={lower_band:.2f}")
+            main_logger.info(Fore.CYAN + f"🧭 VWT Trend: Current={current_trend} | Previous={prev_trend}")
+            main_logger.info(Fore.CYAN + f"📈 Long position (futures): Size={long_info['size']} | Avg Price={long_info['entry_price']:.2f} | Trend valid={trade_state.long_state.is_trend_valid}")
+            main_logger.info(Fore.CYAN + f"📉 Short position (futures): Size={short_info['size']} | Avg Price={short_info['entry_price']:.2f} | Trend valid={trade_state.short_state.is_trend_valid}")
 
-            # 6. Reverse signal: close opposite position if new signal appears (and cancel its TP/SL orders)
-            if sell_signal and long_info['size'] > 0:
-                main_logger.info(Fore.YELLOW + "🔄 Sell signal detected, closing long and cancelling orders")
-                cancel_all_orders(FUTURES_SYMBOL)
-                order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
-                if order:
-                    signal_logger.info(f"[Reverse Close Long] Qty: {long_info['size']} @ {current_price:.2f}")
-                    trade_state.long_state.reset()
-            if buy_signal and short_info['size'] > 0:
-                main_logger.info(Fore.YELLOW + "🔄 Buy signal detected, closing short and cancelling orders")
-                cancel_all_orders(FUTURES_SYMBOL)
-                order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
-                if order:
-                    signal_logger.info(f"[Reverse Close Short] Qty: {short_info['size']} @ {current_price:.2f}")
-                    trade_state.short_state.reset()
+            # 6. 固定止损检查
+            sl_triggered, sl_side = check_stop_loss(FUTURES_SYMBOL, current_price_spot)
+            if sl_triggered:
+                if sl_side == "long" and long_info['size'] > 0:
+                    place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
+                    trade_state.reset_side("long")
+                    signal_logger.info(f"[SL Close Long] Qty: {long_info['size']} @ {current_price_spot:.2f}")
+                elif sl_side == "short" and short_info['size'] > 0:
+                    place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
+                    trade_state.reset_side("short")
+                    signal_logger.info(f"[SL Close Short] Qty: {short_info['size']} @ {current_price_spot:.2f}")
+                main_logger.info(Fore.YELLOW + "⏸️ Stop loss executed, pause 60s")
+                time.sleep(60)
+                continue
 
-            # 7. Check min distance and open new position
-            bars_since_last = len(df) - 1 - signal_history.last_signal_bar if signal_history.last_signal_bar >= 0 else GA_MIN_SIGNAL_DISTANCE + 1
-            if bars_since_last >= GA_MIN_SIGNAL_DISTANCE:
-                usdc_balance = get_usdc_balance()
-                adjusted_qty = calculate_position_size(FUTURES_SYMBOL, usdc_balance, RISK_PERCENTAGE, LEVERAGE, current_price)
+            # 7. 移动止损检查
+            if ENABLE_TRAILING_STOP:
+                current_atr = calculate_atr_rma(df, VWMA_LENGTH).iloc[-1]  # 复用 VWMA 周期的 ATR
+                if long_info['size'] > 0:
+                    if current_price_spot > trade_state.long_state.highest_since_entry:
+                        trade_state.long_state.highest_since_entry = current_price_spot
+                if short_info['size'] > 0:
+                    if current_price_spot < trade_state.short_state.lowest_since_entry:
+                        trade_state.short_state.lowest_since_entry = current_price_spot
 
-                if buy_signal and adjusted_qty > 0 and long_info['size'] == 0 and signal_allowed:
-                    # Cancel any lingering orders before opening new position
-                    cancel_all_orders(FUTURES_SYMBOL)
-                    # Open long
-                    main_logger.info(Fore.GREEN + f"\n{'='*80}\n🟢 [Long Entry] Buy signal\n{'='*80}")
-                    order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, adjusted_qty, 'LONG')
-                    if order:
-                        # Get actual filled quantity and price
-                        new_long, _ = get_position(FUTURES_SYMBOL)
-                        trade_state.long_state.init_new_position(
-                            new_long['size'], new_long['entry_price'],
-                            df['low'].iloc[-1], df['high'].iloc[-1]
-                        )
-                        # Place TP/SL orders on exchange
-                        tp_sl_ok, _, _ = place_tp_sl_orders(FUTURES_SYMBOL, 'LONG', new_long['size'], buy_tp, buy_sl)
-                        if tp_sl_ok:
-                            signal_logger.info(f"[Long Entry] Qty: {adjusted_qty} @ {current_price:.2f} | TP: {buy_tp:.2f} SL: {buy_sl:.2f}")
+                if long_info['size'] > 0:
+                    stop_price = trade_state.long_state.highest_since_entry - current_atr * TRAILING_ATR_MULT
+                    if current_price_spot < stop_price:
+                        main_logger.warning(Fore.YELLOW + f"🚨 Trailing stop hit for LONG: current={current_price_spot:.2f} < stop={stop_price:.2f} (from high={trade_state.long_state.highest_since_entry:.2f})")
+                        close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
+                        if close_order:
+                            signal_logger.info(f"[Trailing Stop Close Long] Qty: {long_info['size']} @ {current_price_spot:.2f}")
+                            trade_state.reset_side("long")
+                            long_info['size'] = 0
                         else:
-                            main_logger.error(Fore.RED + "❌ Failed to place TP/SL for long, consider manual check")
-                        # Update signal history
-                        signal_history.last_signal_bar = len(df) - 1
-                        signal_history.last_signal_direction = "Buy"
-                        if GA_RESTRICT_REPEATED_SIGNALS:
-                            signal_history.last_signal_trend = compute_multi_tf_trend(SPOT_SYMBOL, GA_RESTRICT_TREND_TF_CHOICE, current_price)
-                        save_state()
+                            main_logger.error(Fore.RED + "❌ Trailing stop close long failed!")
 
-                elif sell_signal and adjusted_qty > 0 and short_info['size'] == 0 and signal_allowed:
-                    cancel_all_orders(FUTURES_SYMBOL)
-                    # Open short
-                    main_logger.info(Fore.RED + f"\n{'='*80}\n🔴 [Short Entry] Sell signal\n{'='*80}")
-                    order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, adjusted_qty, 'SHORT')
-                    if order:
-                        _, new_short = get_position(FUTURES_SYMBOL)
-                        trade_state.short_state.init_new_position(
-                            new_short['size'], new_short['entry_price'],
-                            df['low'].iloc[-1], df['high'].iloc[-1]
-                        )
-                        tp_sl_ok, _, _ = place_tp_sl_orders(FUTURES_SYMBOL, 'SHORT', new_short['size'], sell_tp, sell_sl)
-                        if tp_sl_ok:
-                            signal_logger.info(f"[Short Entry] Qty: {adjusted_qty} @ {current_price:.2f} | TP: {sell_tp:.2f} SL: {sell_sl:.2f}")
+                if short_info['size'] > 0:
+                    stop_price = trade_state.short_state.lowest_since_entry + current_atr * TRAILING_ATR_MULT
+                    if current_price_spot > stop_price:
+                        main_logger.warning(Fore.YELLOW + f"🚨 Trailing stop hit for SHORT: current={current_price_spot:.2f} > stop={stop_price:.2f} (from low={trade_state.short_state.lowest_since_entry:.2f})")
+                        close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
+                        if close_order:
+                            signal_logger.info(f"[Trailing Stop Close Short] Qty: {short_info['size']} @ {current_price_spot:.2f}")
+                            trade_state.reset_side("short")
+                            short_info['size'] = 0
                         else:
-                            main_logger.error(Fore.RED + "❌ Failed to place TP/SL for short")
-                        signal_history.last_signal_bar = len(df) - 1
-                        signal_history.last_signal_direction = "Sell"
-                        if GA_RESTRICT_REPEATED_SIGNALS:
-                            signal_history.last_signal_trend = compute_multi_tf_trend(SPOT_SYMBOL, GA_RESTRICT_TREND_TF_CHOICE, current_price)
-                        save_state()
+                            main_logger.error(Fore.RED + "❌ Trailing stop close short failed!")
 
-            # 8. No signal
-            if not buy_signal and not sell_signal:
-                main_logger.info(Fore.CYAN + "💤 No signal")
+            # 8. 部分止盈和加仓
+            long_info, short_info = get_position(FUTURES_SYMBOL)
+            check_partial_take_profit(FUTURES_SYMBOL, current_price_spot, liq_zones)
+            check_breakout_and_add(FUTURES_SYMBOL, current_price_spot, liq_zones, current_trend)
+
+            # 9. VWT 趋势反转开仓信号
+            signal_open_long = (current_trend == 1) and (prev_trend != 1)  # 趋势转为看涨
+            signal_open_short = (current_trend == -1) and (prev_trend != -1)  # 趋势转为看跌
+            
+            main_logger.info(Fore.YELLOW + f"🚨 Entry signals | Long: {signal_open_long} | Short: {signal_open_short}")
+            
+            usdc_balance = get_usdc_balance()
+            adjusted_qty = calculate_position_size(FUTURES_SYMBOL, usdc_balance, RISK_PERCENTAGE, LEVERAGE, current_price_spot)
+
+            # 开多头仓
+            if signal_open_long and adjusted_qty > 0:
+                main_logger.info(Fore.GREEN + "\n" + "="*80)
+                main_logger.info(Fore.GREEN + f"🟢 [Long Signal Triggered] VWT turned bullish: {prev_trend}→{current_trend}")
+                main_logger.info(Fore.GREEN + f"Planned entry: {adjusted_qty} @ {current_price_spot:.2f} (approx)")
+                main_logger.info(Fore.GREEN + "="*80 + "\n")
+                open_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, adjusted_qty, 'LONG')
+                if open_order:
+                    new_long, _ = get_position(FUTURES_SYMBOL)
+                    trade_state.long_state.init_new_position(new_long['size'], new_long['entry_price'], current_trend)
+                    signal_logger.info(f"[Long Entry Done] Qty: {adjusted_qty} @ {current_price_spot:.2f}")
+                else:
+                    main_logger.error(Fore.RED + "❌ Long entry failed")
+
+            # 开空头仓
+            elif signal_open_short and adjusted_qty > 0:
+                main_logger.info(Fore.RED + "\n" + "="*80)
+                main_logger.info(Fore.RED + f"🔴 [Short Signal Triggered] VWT turned bearish: {prev_trend}→{current_trend}")
+                main_logger.info(Fore.RED + f"Planned entry: {adjusted_qty} @ {current_price_spot:.2f} (approx)")
+                main_logger.info(Fore.RED + "="*80 + "\n")
+                open_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, adjusted_qty, 'SHORT')
+                if open_order:
+                    _, new_short = get_position(FUTURES_SYMBOL)
+                    trade_state.short_state.init_new_position(new_short['size'], new_short['entry_price'], current_trend)
+                    signal_logger.info(f"[Short Entry Done] Qty: {adjusted_qty} @ {current_price_spot:.2f}")
+                else:
+                    main_logger.error(Fore.RED + "❌ Short entry failed")
+
+            else:
+                main_logger.info(Fore.CYAN + f"💤 No new entry signals")
 
             main_logger.info(Fore.CYAN + "="*60 + "\n")
             time.sleep(60)
@@ -853,4 +817,3 @@ if __name__ == "__main__":
         run_strategy()
     except KeyboardInterrupt:
         main_logger.info(Fore.CYAN + "👋 Strategy manually stopped")
-        save_state()
