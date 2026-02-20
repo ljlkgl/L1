@@ -88,7 +88,7 @@ STATE_RESET_DELAY = 1
 
 # Trailing Stop Configuration
 ENABLE_TRAILING_STOP = True
-TRAILING_ATR_MULT = 1.1
+TRAILING_ATR_MULT = 2.0
 
 # Binance Client Initialization
 client = Client(API_KEY, API_SECRET, testnet=False, requests_params={'timeout': 30})
@@ -497,8 +497,11 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
         zone_price = liq_zones['resistance']
         if trade_state.long_state.is_new_liquidity_zone(zone_price, "long"):
             klines_data = client.get_klines(symbol=SPOT_SYMBOL, interval=INTERVAL, limit=LOOKBACK)
-            df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume','close_time', 'quote_vol', 'trades', 'taker_buy_base','taker_buy_quote', 'ignore'])
-            for col in ['open', 'high', 'low', 'close']:
+            df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
+                                                           'close_time', 'quote_vol', 'trades', 'taker_buy_base',
+                                                           'taker_buy_quote', 'ignore'])
+            # 修复：转换 volume 列为数值
+            for col in ['open', 'high', 'low', 'close', 'volume']:
                 df_kline[col] = pd.to_numeric(df_kline[col], errors='coerce')
             if (confirm_breakout(df_kline, zone_price, "long")
                 and not trade_state.long_state.has_added_in_zone
@@ -530,8 +533,11 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
         zone_price = liq_zones['support']
         if trade_state.short_state.is_new_liquidity_zone(zone_price, "short"):
             klines_data = client.get_klines(symbol=SPOT_SYMBOL, interval=INTERVAL, limit=LOOKBACK)
-            df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume','close_time', 'quote_vol', 'trades', 'taker_buy_base','taker_buy_quote', 'ignore'])
-            for col in ['open', 'high', 'low', 'close']:
+            df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
+                                                           'close_time', 'quote_vol', 'trades', 'taker_buy_base',
+                                                           'taker_buy_quote', 'ignore'])
+            # 修复：转换 volume 列为数值
+            for col in ['open', 'high', 'low', 'close', 'volume']:
                 df_kline[col] = pd.to_numeric(df_kline[col], errors='coerce')
             if (confirm_breakout(df_kline, zone_price, "short")
                 and not trade_state.short_state.has_added_in_zone
@@ -652,7 +658,8 @@ def run_strategy():
                 'close_time', 'quote_vol', 'trades', 'taker_buy_base',
                 'taker_buy_quote', 'ignore'
             ])
-            for col in ['open', 'high', 'low', 'close']:
+            # 修复：转换所有数值列，包括 volume
+            for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
             # 2. 检查新K线
