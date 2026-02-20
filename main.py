@@ -88,8 +88,7 @@ STATE_RESET_DELAY = 1
 
 # Trailing Stop Configuration
 ENABLE_TRAILING_STOP = True
-TRAILING_ATR_MULT = 2.0
-
+TRAILING_ATR_MULT = 0.55
 # Binance Client Initialization
 client = Client(API_KEY, API_SECRET, testnet=False, requests_params={'timeout': 30})
 main_logger.info(Fore.CYAN + "✅ Binance live trading client initialized (timeout=30s)")
