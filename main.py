@@ -88,14 +88,20 @@ STATE_RESET_DELAY = 1
 
 # Trailing Stop Configuration
 ENABLE_TRAILING_STOP = True
-TRAILING_ATR_MULT = 0.55
+TRAILING_ATR_MULT = 0.6
+
+# ===== NEW: 止损单相关配置 =====
+STOP_ORDER_TYPE = "STOP_MARKET"            # 止损单类型
+STOP_WORKING_TYPE = "MARK_PRICE"           # 使用标记价格触发（避免操纵）
+STOP_TIME_IN_FORCE = "GTC"                 # 一直有效
+
 # Binance Client Initialization
 client = Client(API_KEY, API_SECRET, testnet=False, requests_params={'timeout': 30})
 main_logger.info(Fore.CYAN + "✅ Binance live trading client initialized (timeout=30s)")
 main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} spot klines | Trading on: {FUTURES_SYMBOL} futures")
 main_logger.info(Fore.CYAN + f"📈 Trend indicator: VWT (VWMA + ATR channel) with VWMA length={VWMA_LENGTH}, ATR mult={VWT_ATR_MULT}")
 
-# ———————————————— SideState and TradeState (unchanged) ————————————————
+# ———————————————— SideState and TradeState ————————————————
 @dataclass
 class SideState:
     position_size: float = 0.0
@@ -110,6 +116,8 @@ class SideState:
     last_add_price: float = 0.0
     highest_since_entry: float = 0.0
     lowest_since_entry: float = 0.0
+    # ===== NEW: 存储止损单ID，用于更新/取消 =====
+    stop_order_id: Optional[int] = None
 
     def reset(self):
         self.position_size = 0.0
@@ -124,6 +132,7 @@ class SideState:
         self.last_add_price = 0.0
         self.highest_since_entry = 0.0
         self.lowest_since_entry = 0.0
+        self.stop_order_id = None
 
     def init_new_position(self, pos_size: float, entry_price: float, trend: int):
         self.reset()
@@ -223,7 +232,7 @@ def calculate_vwt_trend(data: pd.DataFrame, vwma_length: int, atr_mult: float) -
     
     return current_trend, prev_trend, vwma.iloc[-1], upper_band.iloc[-1], lower_band.iloc[-1]
 
-# ———————————————— 流动性区域检测（不变） ————————————————
+# ———————————————— 流动性区域检测 ————————————————
 def detect_liquidity_zones(data: pd.DataFrame, lookback_len: int = 8) -> dict:
     df = data.copy()
     closed_df = df.iloc[:-1].copy()
@@ -267,7 +276,7 @@ def confirm_breakout(data: pd.DataFrame, zone_price: float, pos_dir: str) -> boo
         main_logger.info(Fore.BLUE + f"✅ Valid breakout confirmed | Zone Price:{zone_price:.2f} | Breakout Level:{breakout_level:.2f} | Confirm Bars:{BREAKOUT_CONFIRM_BARS}")
     return all_breakout
 
-# ———————————————— 交易辅助函数（不变，但使用 FUTURES_SYMBOL） ————————————————
+# ———————————————— 交易辅助函数（使用 FUTURES_SYMBOL） ————————————————
 def setup_hedge_mode(symbol: str):
     try:
         client.futures_change_position_mode(dualSidePosition=True)
@@ -394,6 +403,100 @@ def place_market_order(symbol: str, side: str, quantity: float, position_side: s
         main_logger.error(Fore.RED + f"❌ [Order Failed] {e} | Side: {side} | PositionSide: {position_side} | Quantity: {quantity}")
         return None
 
+# ===== NEW: 止损单相关函数 =====
+def place_stop_order(symbol: str, side: str, quantity: float, stop_price: float, position_side: str) -> Optional[dict]:
+    """
+    下止损单（STOP_MARKET）
+    side: 与平仓方向一致，如平多仓用 SELL，平空仓用 BUY
+    stop_price: 触发价格
+    """
+    try:
+        price_prec, qty_prec = get_symbol_precision(symbol)
+        quantity = round(quantity, qty_prec)
+        stop_price = round(stop_price, price_prec)
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=STOP_ORDER_TYPE,
+            quantity=quantity,
+            stopPrice=stop_price,
+            workingType=STOP_WORKING_TYPE,
+            timeInForce=STOP_TIME_IN_FORCE,
+            positionSide=position_side
+        )
+        main_logger.info(Fore.GREEN + f"✅ Stop order placed | ID: {order['orderId']} | {position_side} stop@{stop_price} | Qty: {quantity}")
+        return order
+    except Exception as e:
+        main_logger.error(Fore.RED + f"❌ Failed to place stop order: {e}")
+        return None
+
+def cancel_stop_order(symbol: str, order_id: int) -> bool:
+    """取消指定ID的止损单"""
+    try:
+        client.futures_cancel_order(symbol=symbol, orderId=order_id)
+        main_logger.info(Fore.YELLOW + f"✅ Stop order cancelled | ID: {order_id}")
+        return True
+    except Exception as e:
+        main_logger.error(Fore.RED + f"❌ Failed to cancel stop order {order_id}: {e}")
+        return False
+
+def cancel_all_stop_orders(symbol: str, position_side: str) -> None:
+    """取消指定方向的所有止损单（根据订单列表筛选）"""
+    try:
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        for order in open_orders:
+            # 判断是否属于我们的止损单：type为STOP_MARKET且positionSide匹配
+            if order['type'] == STOP_ORDER_TYPE and order['positionSide'] == position_side:
+                cancel_stop_order(symbol, int(order['orderId']))
+    except Exception as e:
+        main_logger.error(Fore.RED + f"❌ Failed to cancel stop orders for {position_side}: {e}")
+
+def update_trailing_stop(symbol: str, position_side: str, new_stop_price: float, quantity: float) -> bool:
+    """
+    更新指定方向的止损单：先取消旧单，再下新单
+    返回是否成功
+    """
+    side = Client.SIDE_SELL if position_side == 'LONG' else Client.SIDE_BUY
+    # 取消当前止损单（如果有记录则用记录ID，否则全取消）
+    if position_side == 'LONG' and trade_state.long_state.stop_order_id is not None:
+        cancel_stop_order(symbol, trade_state.long_state.stop_order_id)
+        trade_state.long_state.stop_order_id = None
+    elif position_side == 'SHORT' and trade_state.short_state.stop_order_id is not None:
+        cancel_stop_order(symbol, trade_state.short_state.stop_order_id)
+        trade_state.short_state.stop_order_id = None
+    else:
+        # 没有记录ID，则全取消该方向的止损单
+        cancel_all_stop_orders(symbol, position_side)
+    # 下新单
+    order = place_stop_order(symbol, side, quantity, new_stop_price, position_side)
+    if order:
+        if position_side == 'LONG':
+            trade_state.long_state.stop_order_id = int(order['orderId'])
+        else:
+            trade_state.short_state.stop_order_id = int(order['orderId'])
+        return True
+    return False
+
+def restore_stop_orders_from_exchange(symbol: str):
+    """
+    从交易所恢复止损单ID到 state 中
+    在程序启动时调用，确保 state 与交易所订单一致
+    """
+    try:
+        open_orders = client.futures_get_open_orders(symbol=symbol)
+        for order in open_orders:
+            if order['type'] != STOP_ORDER_TYPE:
+                continue
+            pos_side = order['positionSide']
+            if pos_side == 'LONG' and trade_state.long_state.position_size > 0:
+                trade_state.long_state.stop_order_id = int(order['orderId'])
+                main_logger.info(Fore.GREEN + f"🔄 Restored LONG stop order ID: {order['orderId']}")
+            elif pos_side == 'SHORT' and trade_state.short_state.position_size > 0:
+                trade_state.short_state.stop_order_id = int(order['orderId'])
+                main_logger.info(Fore.GREEN + f"🔄 Restored SHORT stop order ID: {order['orderId']}")
+    except Exception as e:
+        main_logger.error(Fore.RED + f"❌ Failed to restore stop orders: {e}")
+
 def check_stop_loss(symbol: str, current_price: float) -> Tuple[bool, str]:
     long_info, short_info = get_position(symbol)
     if not ENABLE_STOP_LOSS:
@@ -420,7 +523,7 @@ def restore_trade_state():
         trade_state.long_state.init_new_position(
             pos_size=long_info['size'],
             entry_price=long_info['entry_price'],
-            trend=1  # 恢复时默认趋势为1（需根据实际情况调整，但无法获取历史趋势，只能假设有效）
+            trend=1
         )
         trade_state.long_state.highest_since_entry = long_info['entry_price']
         trade_state.long_state.lowest_since_entry = long_info['entry_price']
@@ -437,6 +540,8 @@ def restore_trade_state():
     if long_info['size'] == 0 and short_info['size'] == 0:
         trade_state.reset_all()
         main_logger.info(Fore.CYAN + "🔄 No positions, state initialized")
+    # 恢复止损单ID
+    restore_stop_orders_from_exchange(FUTURES_SYMBOL)
 
 def check_partial_take_profit(symbol: str, current_price: float, liq_zones: dict):
     long_info, short_info = get_position(symbol)
@@ -499,7 +604,6 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
             df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
                                                            'close_time', 'quote_vol', 'trades', 'taker_buy_base',
                                                            'taker_buy_quote', 'ignore'])
-            # 修复：转换 volume 列为数值
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df_kline[col] = pd.to_numeric(df_kline[col], errors='coerce')
             if (confirm_breakout(df_kline, zone_price, "long")
@@ -535,7 +639,6 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
             df_kline = pd.DataFrame(klines_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
                                                            'close_time', 'quote_vol', 'trades', 'taker_buy_base',
                                                            'taker_buy_quote', 'ignore'])
-            # 修复：转换 volume 列为数值
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df_kline[col] = pd.to_numeric(df_kline[col], errors='coerce')
             if (confirm_breakout(df_kline, zone_price, "short")
@@ -568,7 +671,6 @@ def force_close_invalid_trend_positions(current_trend: int, current_price: float
     """
     long_info, short_info = get_position(FUTURES_SYMBOL)
     if long_info['size'] > 0:
-        # 检查多头是否应平仓：开仓时趋势应为1，当前趋势为-1则无效
         trade_state.long_state.is_trend_valid = not (current_trend == -1 and trade_state.long_state.trend_at_open == 1)
         main_logger.info(Fore.CYAN + f"🧮 Long trend validity | Current VWT trend:{current_trend} | Open trend:{trade_state.long_state.trend_at_open} | Valid:{trade_state.long_state.is_trend_valid}")
         if not trade_state.long_state.is_trend_valid:
@@ -581,6 +683,9 @@ def force_close_invalid_trend_positions(current_trend: int, current_price: float
             close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
             if close_order:
                 signal_logger.info(f"[Force Close Long] Qty: {long_info['size']} @ {current_price:.2f}")
+                # ===== NEW: 平仓后取消止损单 =====
+                if trade_state.long_state.stop_order_id:
+                    cancel_stop_order(FUTURES_SYMBOL, trade_state.long_state.stop_order_id)
             else:
                 main_logger.error(Fore.RED + "❌ Force close long failed! Manual intervention required!")
             trade_state.reset_side("long")
@@ -598,10 +703,59 @@ def force_close_invalid_trend_positions(current_trend: int, current_price: float
             close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
             if close_order:
                 signal_logger.info(f"[Force Close Short] Qty: {short_info['size']} @ {current_price:.2f}")
+                # ===== NEW: 平仓后取消止损单 =====
+                if trade_state.short_state.stop_order_id:
+                    cancel_stop_order(FUTURES_SYMBOL, trade_state.short_state.stop_order_id)
             else:
                 main_logger.error(Fore.RED + "❌ Force close short failed! Manual intervention required!")
             trade_state.reset_side("short")
             main_logger.info(Fore.YELLOW + "⏸️ Short force close done")
+
+# ===== NEW: 更新移动止损的函数（基于ATR） =====
+def update_trailing_stops(symbol: str, current_price: float, current_atr: float):
+    """根据最新价格和ATR更新移动止损单"""
+    if not ENABLE_TRAILING_STOP:
+        return
+
+    # 处理多头
+    long_info, _ = get_position(symbol)
+    if long_info['size'] > 0:
+        # 更新最高价
+        if current_price > trade_state.long_state.highest_since_entry:
+            trade_state.long_state.highest_since_entry = current_price
+        # 计算新的止损价：最高价 - ATR * 系数
+        new_stop = trade_state.long_state.highest_since_entry - current_atr * TRAILING_ATR_MULT
+        # 只有当新止损价高于当前止损价时才更新（否则保持不变）
+        # 需要获取当前止损单的触发价（如果存在）
+        current_stop = None
+        if trade_state.long_state.stop_order_id:
+            try:
+                order = client.futures_get_order(symbol=symbol, orderId=trade_state.long_state.stop_order_id)
+                current_stop = float(order['stopPrice'])
+            except:
+                pass
+        if current_stop is None or new_stop > current_stop:
+            main_logger.info(Fore.CYAN + f"🔄 Updating LONG trailing stop: {current_stop} -> {new_stop:.2f} (high={trade_state.long_state.highest_since_entry:.2f}, ATR={current_atr:.2f})")
+            update_trailing_stop(symbol, 'LONG', new_stop, long_info['size'])
+
+    # 处理空头
+    _, short_info = get_position(symbol)
+    if short_info['size'] > 0:
+        # 更新最低价
+        if current_price < trade_state.short_state.lowest_since_entry:
+            trade_state.short_state.lowest_since_entry = current_price
+        # 新止损价：最低价 + ATR * 系数
+        new_stop = trade_state.short_state.lowest_since_entry + current_atr * TRAILING_ATR_MULT
+        current_stop = None
+        if trade_state.short_state.stop_order_id:
+            try:
+                order = client.futures_get_order(symbol=symbol, orderId=trade_state.short_state.stop_order_id)
+                current_stop = float(order['stopPrice'])
+            except:
+                pass
+        if current_stop is None or new_stop < current_stop:
+            main_logger.info(Fore.CYAN + f"🔄 Updating SHORT trailing stop: {current_stop} -> {new_stop:.2f} (low={trade_state.short_state.lowest_since_entry:.2f}, ATR={current_atr:.2f})")
+            update_trailing_stop(symbol, 'SHORT', new_stop, short_info['size'])
 
 # ———————————————— 主策略循环（VWT 信号） ————————————————
 def run_strategy():
@@ -610,7 +764,7 @@ def run_strategy():
     main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} spot klines | Trading on: {FUTURES_SYMBOL} futures")
     main_logger.info(Fore.CYAN + f"⚙️  VWT Params: VWMA Length={VWMA_LENGTH} | ATR Multiplier={VWT_ATR_MULT}")
     main_logger.info(Fore.CYAN + f"💰  Risk Mgmt: Leverage={LEVERAGE}x | Initial Entry={RISK_PERCENTAGE}% | Add Ratio={ADD_RISK_PCT}%")
-    main_logger.info(Fore.CYAN + f"🛡️  Trailing Stop: Enabled={ENABLE_TRAILING_STOP} | ATR Mult={TRAILING_ATR_MULT}")
+    main_logger.info(Fore.CYAN + f"🛡️  Trailing Stop: Enabled={ENABLE_TRAILING_STOP} | ATR Mult={TRAILING_ATR_MULT} (Exchange STOP_MARKET)")
     main_logger.info(Fore.CYAN + "="*80)
 
     try:
@@ -657,7 +811,6 @@ def run_strategy():
                 'close_time', 'quote_vol', 'trades', 'taker_buy_base',
                 'taker_buy_quote', 'ignore'
             ])
-            # 修复：转换所有数值列，包括 volume
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -698,6 +851,9 @@ def run_strategy():
 
             current_trend, prev_trend, vwma_val, upper_band, lower_band = calculate_vwt_trend(df, VWMA_LENGTH, VWT_ATR_MULT)
 
+            # 计算当前ATR（用于移动止损）
+            current_atr = calculate_atr_rma(df, VWMA_LENGTH).iloc[-1]
+
             # 4. 检测流动性区域
             liq_zones = detect_liquidity_zones(df, lookback_len=LIQ_SWEEP_LENGTH)
             res_text = f"{liq_zones['resistance']:.2f}" if not np.isnan(liq_zones['resistance']) else "None"
@@ -717,61 +873,35 @@ def run_strategy():
             main_logger.info(Fore.CYAN + f"📈 Long position (futures): Size={long_info['size']} | Avg Price={long_info['entry_price']:.2f} | Trend valid={trade_state.long_state.is_trend_valid}")
             main_logger.info(Fore.CYAN + f"📉 Short position (futures): Size={short_info['size']} | Avg Price={short_info['entry_price']:.2f} | Trend valid={trade_state.short_state.is_trend_valid}")
 
-            # 6. 固定止损检查
+            # 6. 固定止损检查（保留，可与移动止损并存）
             sl_triggered, sl_side = check_stop_loss(FUTURES_SYMBOL, current_price_spot)
             if sl_triggered:
                 if sl_side == "long" and long_info['size'] > 0:
                     place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
+                    if trade_state.long_state.stop_order_id:
+                        cancel_stop_order(FUTURES_SYMBOL, trade_state.long_state.stop_order_id)
                     trade_state.reset_side("long")
                     signal_logger.info(f"[SL Close Long] Qty: {long_info['size']} @ {current_price_spot:.2f}")
                 elif sl_side == "short" and short_info['size'] > 0:
                     place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
+                    if trade_state.short_state.stop_order_id:
+                        cancel_stop_order(FUTURES_SYMBOL, trade_state.short_state.stop_order_id)
                     trade_state.reset_side("short")
                     signal_logger.info(f"[SL Close Short] Qty: {short_info['size']} @ {current_price_spot:.2f}")
                 main_logger.info(Fore.YELLOW + "⏸️ Stop loss executed, pause 60s")
                 time.sleep(60)
                 continue
 
-            # 7. 移动止损检查
+            # ===== MODIFIED: 移动止损检查（改为更新交易所止损单） =====
             if ENABLE_TRAILING_STOP:
-                current_atr = calculate_atr_rma(df, VWMA_LENGTH).iloc[-1]  # 复用 VWMA 周期的 ATR
-                if long_info['size'] > 0:
-                    if current_price_spot > trade_state.long_state.highest_since_entry:
-                        trade_state.long_state.highest_since_entry = current_price_spot
-                if short_info['size'] > 0:
-                    if current_price_spot < trade_state.short_state.lowest_since_entry:
-                        trade_state.short_state.lowest_since_entry = current_price_spot
+                update_trailing_stops(FUTURES_SYMBOL, current_price_spot, current_atr)
 
-                if long_info['size'] > 0:
-                    stop_price = trade_state.long_state.highest_since_entry - current_atr * TRAILING_ATR_MULT
-                    if current_price_spot < stop_price:
-                        main_logger.warning(Fore.YELLOW + f"🚨 Trailing stop hit for LONG: current={current_price_spot:.2f} < stop={stop_price:.2f} (from high={trade_state.long_state.highest_since_entry:.2f})")
-                        close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
-                        if close_order:
-                            signal_logger.info(f"[Trailing Stop Close Long] Qty: {long_info['size']} @ {current_price_spot:.2f}")
-                            trade_state.reset_side("long")
-                            long_info['size'] = 0
-                        else:
-                            main_logger.error(Fore.RED + "❌ Trailing stop close long failed!")
-
-                if short_info['size'] > 0:
-                    stop_price = trade_state.short_state.lowest_since_entry + current_atr * TRAILING_ATR_MULT
-                    if current_price_spot > stop_price:
-                        main_logger.warning(Fore.YELLOW + f"🚨 Trailing stop hit for SHORT: current={current_price_spot:.2f} > stop={stop_price:.2f} (from low={trade_state.short_state.lowest_since_entry:.2f})")
-                        close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
-                        if close_order:
-                            signal_logger.info(f"[Trailing Stop Close Short] Qty: {short_info['size']} @ {current_price_spot:.2f}")
-                            trade_state.reset_side("short")
-                            short_info['size'] = 0
-                        else:
-                            main_logger.error(Fore.RED + "❌ Trailing stop close short failed!")
-
-            # 8. 部分止盈和加仓
+            # 7. 部分止盈和加仓
             long_info, short_info = get_position(FUTURES_SYMBOL)
             check_partial_take_profit(FUTURES_SYMBOL, current_price_spot, liq_zones)
             check_breakout_and_add(FUTURES_SYMBOL, current_price_spot, liq_zones, current_trend)
 
-            # 9. VWT 趋势反转开仓信号
+            # 8. VWT 趋势反转开仓信号
             signal_open_long = (current_trend == 1) and (prev_trend != 1)  # 趋势转为看涨
             signal_open_short = (current_trend == -1) and (prev_trend != -1)  # 趋势转为看跌
             
@@ -790,6 +920,12 @@ def run_strategy():
                 if open_order:
                     new_long, _ = get_position(FUTURES_SYMBOL)
                     trade_state.long_state.init_new_position(new_long['size'], new_long['entry_price'], current_trend)
+                    # ===== NEW: 开仓后立即下初始止损单 =====
+                    if ENABLE_TRAILING_STOP:
+                        initial_stop = new_long['entry_price'] - current_atr * TRAILING_ATR_MULT
+                        stop_order = place_stop_order(FUTURES_SYMBOL, Client.SIDE_SELL, new_long['size'], initial_stop, 'LONG')
+                        if stop_order:
+                            trade_state.long_state.stop_order_id = int(stop_order['orderId'])
                     signal_logger.info(f"[Long Entry Done] Qty: {adjusted_qty} @ {current_price_spot:.2f}")
                 else:
                     main_logger.error(Fore.RED + "❌ Long entry failed")
@@ -804,6 +940,12 @@ def run_strategy():
                 if open_order:
                     _, new_short = get_position(FUTURES_SYMBOL)
                     trade_state.short_state.init_new_position(new_short['size'], new_short['entry_price'], current_trend)
+                    # ===== NEW: 开仓后立即下初始止损单 =====
+                    if ENABLE_TRAILING_STOP:
+                        initial_stop = new_short['entry_price'] + current_atr * TRAILING_ATR_MULT
+                        stop_order = place_stop_order(FUTURES_SYMBOL, Client.SIDE_BUY, new_short['size'], initial_stop, 'SHORT')
+                        if stop_order:
+                            trade_state.short_state.stop_order_id = int(stop_order['orderId'])
                     signal_logger.info(f"[Short Entry Done] Qty: {adjusted_qty} @ {current_price_spot:.2f}")
                 else:
                     main_logger.error(Fore.RED + "❌ Short entry failed")
@@ -812,11 +954,11 @@ def run_strategy():
                 main_logger.info(Fore.CYAN + f"💤 No new entry signals")
 
             main_logger.info(Fore.CYAN + "="*60 + "\n")
-            time.sleep(60)
+            time.sleep(30)
 
         except Exception as e:
             main_logger.error(Fore.RED + f"❌ Main loop error: {e}", exc_info=True)
-            time.sleep(60)
+            time.sleep(30)
 
 if __name__ == "__main__":
     try:
