@@ -65,6 +65,16 @@ LOOKBACK = 600
 VWMA_LENGTH = 34                  # VWMA 周期
 VWT_ATR_MULT = 1.5                # ATR 乘数
 
+# ========== L1 近端滤波器参数 ==========
+L1_ATR_MULT = 1.5                 # ATR乘数（对应指标中的 atrMultInput）
+L1_MU = 0.6                       # 自适应率（对应 muInput）
+
+# ========== 趋势过滤参数（与修改后的指标一致） ==========
+TREND_CONFIRM_BARS = 2             # 连续确认K线数
+USE_CONSENSUS_FILTER = True       # 是否要求VWT与L1共识（默认关闭）
+USE_ATR_FILTER = True              # 是否启用ATR阈值过滤（默认关闭）
+MIN_ATR_PCT = 0.001                # 最小ATR百分比（0.1%）
+
 # Leverage & Risk Management
 LEVERAGE = 20
 MARGIN_TYPE = "ISOLATED"
@@ -90,7 +100,7 @@ STATE_RESET_DELAY = 1
 ENABLE_TRAILING_STOP = True
 TRAILING_ATR_MULT = 0.6
 
-# ===== NEW: 止损单相关配置 =====
+# ===== 止损单相关配置 =====
 STOP_ORDER_TYPE = "STOP_MARKET"            # 止损单类型
 STOP_WORKING_TYPE = "MARK_PRICE"           # 使用标记价格触发（避免操纵）
 STOP_TIME_IN_FORCE = "GTC"                 # 一直有效
@@ -99,7 +109,7 @@ STOP_TIME_IN_FORCE = "GTC"                 # 一直有效
 client = Client(API_KEY, API_SECRET, testnet=False, requests_params={'timeout': 30})
 main_logger.info(Fore.CYAN + "✅ Binance live trading client initialized (timeout=30s)")
 main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} spot klines | Trading on: {FUTURES_SYMBOL} futures")
-main_logger.info(Fore.CYAN + f"📈 Trend indicator: VWT (VWMA + ATR channel) with VWMA length={VWMA_LENGTH}, ATR mult={VWT_ATR_MULT}")
+main_logger.info(Fore.CYAN + f"📈 Trend indicator: VWT + L1 filter (confirm_bars={TREND_CONFIRM_BARS})")
 
 # ———————————————— SideState and TradeState ————————————————
 @dataclass
@@ -107,7 +117,7 @@ class SideState:
     position_size: float = 0.0
     entry_price: float = 0.0
     initial_entry_price: float = 0.0
-    trend_at_open: int = 0          # 开仓时的 VWT 趋势：1=看涨，-1=看跌
+    trend_at_open: int = 0          # 开仓时的过滤趋势：1=看涨，-1=看跌
     is_trend_valid: bool = False
     last_operated_zone_price: float = 0.0
     has_partial_tp_in_zone: bool = False
@@ -116,7 +126,6 @@ class SideState:
     last_add_price: float = 0.0
     highest_since_entry: float = 0.0
     lowest_since_entry: float = 0.0
-    # ===== NEW: 存储止损单ID，用于更新/取消 =====
     stop_order_id: Optional[int] = None
 
     def reset(self):
@@ -197,40 +206,156 @@ def calculate_atr_rma(data: pd.DataFrame, period: int) -> pd.Series:
     return atr
 
 # ———————————————— VWT 趋势计算（核心信号） ————————————————
-def calculate_vwt_trend(data: pd.DataFrame, vwma_length: int, atr_mult: float) -> tuple[int, int, float, float, float]:
+def calculate_vwt(data: pd.DataFrame, vwma_length: int, atr_mult: float) -> tuple:
     """
-    计算 VWT 趋势及通道
-    返回: (current_trend, prev_trend, vwma_basis, upper_band, lower_band)
-    trend: 1=看涨（收盘价>上轨），-1=看跌（收盘价<下轨），0=中性（通道内）
+    计算 VWT 通道及趋势序列
+    返回: (vwma_series, upper_band_series, lower_band_series, vwt_trend_series)
     """
     close = data['close']
     volume = data['volume']
-    
-    # VWMA = (price * volume) 的滚动和 / volume 的滚动和
     vwma = (close * volume).rolling(window=vwma_length).sum() / volume.rolling(window=vwma_length).sum()
-    
-    # 用 RMA 计算 ATR，周期与 VWMA 相同
     atr_vwt = calculate_atr_rma(data, vwma_length)
-    
     upper_band = vwma + atr_vwt * atr_mult
     lower_band = vwma - atr_vwt * atr_mult
+    vwt_trend = pd.Series(0, index=data.index)
+    vwt_trend[close > upper_band] = 1
+    vwt_trend[close < lower_band] = -1
+    return vwma, upper_band, lower_band, vwt_trend, atr_vwt
+
+# ———————————————— L1 近端滤波器 ————————————————
+def calculate_l1_filter(data: pd.DataFrame, atr_mult: float, mu: float, source_field='close') -> pd.Series:
+    """
+    计算L1近端滤波器（自适应滤波器）
+    返回滤波后的序列 z
+    """
+    src = data[source_field].values
+    length = len(src)
+    z = np.zeros(length)
+    v = np.zeros(length)
     
-    # 确定当前趋势
-    current_trend = 0
-    if close.iloc[-1] > upper_band.iloc[-1]:
-        current_trend = 1
-    elif close.iloc[-1] < lower_band.iloc[-1]:
-        current_trend = -1
+    # 计算ATR（周期200）
+    atr_200 = calculate_atr_rma(data, 200).values
+    threshold = atr_200 * atr_mult
     
-    # 前一趋势（使用上根K线的收盘价比较）
-    prev_trend = 0
-    if len(close) > 1:
-        if close.iloc[-2] > upper_band.iloc[-2]:
-            prev_trend = 1
-        elif close.iloc[-2] < lower_band.iloc[-2]:
-            prev_trend = -1
+    for i in range(length):
+        if i == 0:
+            z[i] = src[i]
+            v[i] = 0.0
+        else:
+            z_prev = z[i-1]
+            v_prev = v[i-1]
+            z_pred = z_prev + v_prev
+            z_temp = z_pred + mu * (src[i] - z_pred)
+            diff = z_temp - z_prev
+            
+            if abs(diff) > threshold[i]:
+                v[i] = np.sign(diff) * (abs(diff) - threshold[i])
+            else:
+                v[i] = 0.0
+            z[i] = z_prev + v[i]
     
-    return current_trend, prev_trend, vwma.iloc[-1], upper_band.iloc[-1], lower_band.iloc[-1]
+    return pd.Series(z, index=data.index)
+
+def calculate_l1_trend_series(l1_series: pd.Series) -> pd.Series:
+    """根据L1序列计算趋势（1=上升，-1=下降，0=持平）"""
+    trend = pd.Series(0, index=l1_series.index)
+    trend[l1_series > l1_series.shift(1)] = 1
+    trend[l1_series < l1_series.shift(1)] = -1
+    return trend
+
+# ———————————————— 过滤趋势计算 ————————————————
+def calculate_filtered_trend(data: pd.DataFrame,
+                             vwma_length: int,
+                             vwt_atr_mult: float,
+                             l1_atr_mult: float,
+                             l1_mu: float,
+                             confirm_bars: int,
+                             use_consensus: bool,
+                             use_atr_filter: bool,
+                             min_atr_pct: float) -> tuple:
+    """
+    返回:
+        filtered_trend: 最新过滤趋势值 (1, -1, 0)
+        prev_filtered_trend: 前一周期过滤趋势值
+        vwt_trend: 最新VWT趋势
+        l1_trend: 最新L1趋势
+        current_atr_pct: 当前ATR百分比
+        upper_band, lower_band, vwma (用于日志/绘图)
+    """
+    # 计算VWT
+    vwma, upper_band, lower_band, vwt_trend_series, atr_vwt_series = calculate_vwt(data, vwma_length, vwt_atr_mult)
+    
+    # 计算L1
+    l1_series = calculate_l1_filter(data, l1_atr_mult, l1_mu)
+    l1_trend_series = calculate_l1_trend_series(l1_series)
+    
+    # 获取最新值和前值
+    current_vwt = vwt_trend_series.iloc[-1]
+    current_l1 = l1_trend_series.iloc[-1]
+    current_atr = atr_vwt_series.iloc[-1]
+    current_close = data['close'].iloc[-1]
+    current_atr_pct = current_atr / current_close
+    
+    # 构建历史趋势列表（最近 confirm_bars 个）
+    recent_vwt = vwt_trend_series.iloc[-confirm_bars:].values
+    recent_l1 = l1_trend_series.iloc[-confirm_bars:].values
+    
+    # 检查连续一致
+    all_bull = all(v == 1 for v in recent_vwt)
+    all_bear = all(v == -1 for v in recent_vwt)
+    
+    if use_consensus:
+        all_bull = all_bull and all(l == 1 for l in recent_l1)
+        all_bear = all_bear and all(l == -1 for l in recent_l1)
+    
+    # ATR过滤
+    atr_ok = not use_atr_filter or (current_atr_pct >= min_atr_pct)
+    
+    if all_bull and atr_ok:
+        filtered_trend = 1
+    elif all_bear and atr_ok:
+        filtered_trend = -1
+    else:
+        filtered_trend = 0
+    
+    # 计算前一周期的过滤趋势（用于判断变化）
+    # 为了简化，我们用同样的逻辑但偏移一根K线
+    # 取倒数第二根K线及其之前的数据
+    if len(data) > confirm_bars + 1:
+        # 构建前一周期的数据子集（去掉最后一根）
+        data_prev = data.iloc[:-1]
+        # 递归调用（注意避免无限递归，这里仅做示意，实际可复用计算）
+        # 为简化，我们直接复用已计算的序列，但需要确认前一周期的连续一致情况
+        # 更简单：计算 filtered_trend_series 所有值（循环）
+        # 这里为了简洁，我们仅计算当前和前一值，不计算全序列
+        # 我们通过偏移序列来判断前一期是否满足条件
+        # 这里略复杂，我们采用一个简单方法：计算全序列的filtered_trend
+        # 但为了性能，我们只计算最近几根
+        # 简单实现：直接判断前一期的最近confirm_bars是否一致
+        if len(vwt_trend_series) >= confirm_bars + 1:
+            prev_recent_vwt = vwt_trend_series.iloc[-confirm_bars-1:-1].values
+            prev_recent_l1 = l1_trend_series.iloc[-confirm_bars-1:-1].values
+            prev_all_bull = all(v == 1 for v in prev_recent_vwt)
+            prev_all_bear = all(v == -1 for v in prev_recent_vwt)
+            if use_consensus:
+                prev_all_bull = prev_all_bull and all(l == 1 for l in prev_recent_l1)
+                prev_all_bear = prev_all_bear and all(l == -1 for l in prev_recent_l1)
+            # ATR阈值用前一周期的ATR
+            prev_atr_pct = atr_vwt_series.iloc[-2] / data['close'].iloc[-2] if len(data) > 1 else 0
+            prev_atr_ok = not use_atr_filter or (prev_atr_pct >= min_atr_pct)
+            
+            if prev_all_bull and prev_atr_ok:
+                prev_filtered_trend = 1
+            elif prev_all_bear and prev_atr_ok:
+                prev_filtered_trend = -1
+            else:
+                prev_filtered_trend = 0
+        else:
+            prev_filtered_trend = 0
+    else:
+        prev_filtered_trend = 0
+    
+    return filtered_trend, prev_filtered_trend, current_vwt, current_l1, current_atr_pct, upper_band.iloc[-1], lower_band.iloc[-1], vwma.iloc[-1]
 
 # ———————————————— 流动性区域检测 ————————————————
 def detect_liquidity_zones(data: pd.DataFrame, lookback_len: int = 8) -> dict:
@@ -403,13 +528,7 @@ def place_market_order(symbol: str, side: str, quantity: float, position_side: s
         main_logger.error(Fore.RED + f"❌ [Order Failed] {e} | Side: {side} | PositionSide: {position_side} | Quantity: {quantity}")
         return None
 
-# ===== NEW: 止损单相关函数 =====
 def place_stop_order(symbol: str, side: str, quantity: float, stop_price: float, position_side: str) -> Optional[dict]:
-    """
-    下止损单（STOP_MARKET）
-    side: 与平仓方向一致，如平多仓用 SELL，平空仓用 BUY
-    stop_price: 触发价格
-    """
     try:
         price_prec, qty_prec = get_symbol_precision(symbol)
         quantity = round(quantity, qty_prec)
@@ -431,7 +550,6 @@ def place_stop_order(symbol: str, side: str, quantity: float, stop_price: float,
         return None
 
 def cancel_stop_order(symbol: str, order_id: int) -> bool:
-    """取消指定ID的止损单"""
     try:
         client.futures_cancel_order(symbol=symbol, orderId=order_id)
         main_logger.info(Fore.YELLOW + f"✅ Stop order cancelled | ID: {order_id}")
@@ -441,23 +559,16 @@ def cancel_stop_order(symbol: str, order_id: int) -> bool:
         return False
 
 def cancel_all_stop_orders(symbol: str, position_side: str) -> None:
-    """取消指定方向的所有止损单（根据订单列表筛选）"""
     try:
         open_orders = client.futures_get_open_orders(symbol=symbol)
         for order in open_orders:
-            # 判断是否属于我们的止损单：type为STOP_MARKET且positionSide匹配
             if order['type'] == STOP_ORDER_TYPE and order['positionSide'] == position_side:
                 cancel_stop_order(symbol, int(order['orderId']))
     except Exception as e:
         main_logger.error(Fore.RED + f"❌ Failed to cancel stop orders for {position_side}: {e}")
 
 def update_trailing_stop(symbol: str, position_side: str, new_stop_price: float, quantity: float) -> bool:
-    """
-    更新指定方向的止损单：先取消旧单，再下新单
-    返回是否成功
-    """
     side = Client.SIDE_SELL if position_side == 'LONG' else Client.SIDE_BUY
-    # 取消当前止损单（如果有记录则用记录ID，否则全取消）
     if position_side == 'LONG' and trade_state.long_state.stop_order_id is not None:
         cancel_stop_order(symbol, trade_state.long_state.stop_order_id)
         trade_state.long_state.stop_order_id = None
@@ -465,9 +576,7 @@ def update_trailing_stop(symbol: str, position_side: str, new_stop_price: float,
         cancel_stop_order(symbol, trade_state.short_state.stop_order_id)
         trade_state.short_state.stop_order_id = None
     else:
-        # 没有记录ID，则全取消该方向的止损单
         cancel_all_stop_orders(symbol, position_side)
-    # 下新单
     order = place_stop_order(symbol, side, quantity, new_stop_price, position_side)
     if order:
         if position_side == 'LONG':
@@ -478,10 +587,6 @@ def update_trailing_stop(symbol: str, position_side: str, new_stop_price: float,
     return False
 
 def restore_stop_orders_from_exchange(symbol: str):
-    """
-    从交易所恢复止损单ID到 state 中
-    在程序启动时调用，确保 state 与交易所订单一致
-    """
     try:
         open_orders = client.futures_get_open_orders(symbol=symbol)
         for order in open_orders:
@@ -523,7 +628,7 @@ def restore_trade_state():
         trade_state.long_state.init_new_position(
             pos_size=long_info['size'],
             entry_price=long_info['entry_price'],
-            trend=1
+            trend=1   # 恢复时默认趋势为看涨，后续会被重新评估
         )
         trade_state.long_state.highest_since_entry = long_info['entry_price']
         trade_state.long_state.lowest_since_entry = long_info['entry_price']
@@ -540,7 +645,6 @@ def restore_trade_state():
     if long_info['size'] == 0 and short_info['size'] == 0:
         trade_state.reset_all()
         main_logger.info(Fore.CYAN + "🔄 No positions, state initialized")
-    # 恢复止损单ID
     restore_stop_orders_from_exchange(FUTURES_SYMBOL)
 
 def check_partial_take_profit(symbol: str, current_price: float, liq_zones: dict):
@@ -588,14 +692,17 @@ def check_partial_take_profit(symbol: str, current_price: float, liq_zones: dict
                     trade_state.short_state.update_position(new_short['size'], new_short['entry_price'])
                     signal_logger.info(f"[Short Partial TP Done] Close {buy_qty} @ {current_price} | Support: {zone_price} | Remaining: {new_short['size']}")
 
-def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, current_trend: int):
+def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, filtered_trend: int):
+    """
+    加仓逻辑：趋势必须与开仓趋势一致（使用 filtered_trend）
+    """
     long_info, short_info = get_position(symbol)
     usdc_balance = get_usdc_balance()
     qty_precision = get_symbol_precision(symbol)[1]
 
     if (long_info['size'] > 0 
         and trade_state.long_state.is_trend_valid 
-        and current_trend == 1 
+        and filtered_trend == 1   # 修改：使用 filtered_trend
         and trade_state.long_state.total_add_times < MAX_ADD_TIMES
         and not np.isnan(liq_zones['resistance'])):
         zone_price = liq_zones['resistance']
@@ -615,7 +722,7 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
                     return
                 main_logger.info(Fore.BLUE + "\n" + "="*80)
                 main_logger.info(Fore.BLUE + f"🚀 [Long Breakout Add] Valid breakout of resistance: {zone_price:.2f}")
-                main_logger.info(Fore.BLUE + f"Trend confirmed: VWT remains long | Add count: {trade_state.long_state.total_add_times+1}/{MAX_ADD_TIMES}")
+                main_logger.info(Fore.BLUE + f"Trend confirmed: filtered_trend remains long | Add count: {trade_state.long_state.total_add_times+1}/{MAX_ADD_TIMES}")
                 main_logger.info(Fore.BLUE + f"Action: Add long | Qty: {add_qty}")
                 main_logger.info(Fore.BLUE + "="*80 + "\n")
                 order = place_market_order(symbol, Client.SIDE_BUY, add_qty, 'LONG')
@@ -630,7 +737,7 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
 
     if (short_info['size'] > 0 
         and trade_state.short_state.is_trend_valid 
-        and current_trend == -1 
+        and filtered_trend == -1   # 修改：使用 filtered_trend
         and trade_state.short_state.total_add_times < MAX_ADD_TIMES
         and not np.isnan(liq_zones['support'])):
         zone_price = liq_zones['support']
@@ -650,7 +757,7 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
                     return
                 main_logger.info(Fore.BLUE + "\n" + "="*80)
                 main_logger.info(Fore.BLUE + f"🚀 [Short Breakdown Add] Valid breakdown of support: {zone_price:.2f}")
-                main_logger.info(Fore.BLUE + f"Trend confirmed: VWT remains short | Add count: {trade_state.short_state.total_add_times+1}/{MAX_ADD_TIMES}")
+                main_logger.info(Fore.BLUE + f"Trend confirmed: filtered_trend remains short | Add count: {trade_state.short_state.total_add_times+1}/{MAX_ADD_TIMES}")
                 main_logger.info(Fore.BLUE + f"Action: Add short | Qty: {add_qty}")
                 main_logger.info(Fore.BLUE + "="*80 + "\n")
                 order = place_market_order(symbol, Client.SIDE_SELL, add_qty, 'SHORT')
@@ -663,27 +770,25 @@ def check_breakout_and_add(symbol: str, current_price: float, liq_zones: dict, c
                     trade_state.short_state.update_position(new_short['size'], new_short['entry_price'])
                     signal_logger.info(f"[Short Add Done] Add {add_qty} @ {current_price} | Breakdown: {zone_price} | Total adds: {trade_state.short_state.total_add_times} | Total pos: {new_short['size']}")
 
-def force_close_invalid_trend_positions(current_trend: int, current_price: float):
+def force_close_invalid_trend_positions(filtered_trend: int, current_price: float):
     """
-    强制平仓与当前 VWT 趋势反向的仓位
+    强制平仓与当前过滤趋势反向的仓位
     规则：如果开仓趋势为1，当前趋势为-1，则平多；如果开仓趋势为-1，当前趋势为1，则平空。
-    趋势为0时不平仓（视为中性，不强制）
     """
     long_info, short_info = get_position(FUTURES_SYMBOL)
     if long_info['size'] > 0:
-        trade_state.long_state.is_trend_valid = not (current_trend == -1 and trade_state.long_state.trend_at_open == 1)
-        main_logger.info(Fore.CYAN + f"🧮 Long trend validity | Current VWT trend:{current_trend} | Open trend:{trade_state.long_state.trend_at_open} | Valid:{trade_state.long_state.is_trend_valid}")
+        trade_state.long_state.is_trend_valid = not (filtered_trend == -1 and trade_state.long_state.trend_at_open == 1)
+        main_logger.info(Fore.CYAN + f"🧮 Long trend validity | Current filtered trend:{filtered_trend} | Open trend:{trade_state.long_state.trend_at_open} | Valid:{trade_state.long_state.is_trend_valid}")
         if not trade_state.long_state.is_trend_valid:
-            main_logger.warning(Fore.YELLOW + "⚠️ Long trend invalid (VWT turned bearish), force close long position!")
+            main_logger.warning(Fore.YELLOW + "⚠️ Long trend invalid (filtered trend turned bearish), force close long position!")
             main_logger.info(Fore.RED + f"\n{'='*80}")
-            main_logger.info(Fore.RED + "🔴 [Force Close Long] VWT trend reversed")
-            main_logger.info(Fore.RED + f"Reason: Current VWT trend ({current_trend}) vs open trend ({trade_state.long_state.trend_at_open})")
+            main_logger.info(Fore.RED + "🔴 [Force Close Long] Filtered trend reversed")
+            main_logger.info(Fore.RED + f"Reason: Current filtered trend ({filtered_trend}) vs open trend ({trade_state.long_state.trend_at_open})")
             main_logger.info(Fore.RED + f"Close Quantity: {long_info['size']} | Current Price: {current_price:.2f}")
             main_logger.info(Fore.RED + f"{'='*80}\n")
             close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
             if close_order:
                 signal_logger.info(f"[Force Close Long] Qty: {long_info['size']} @ {current_price:.2f}")
-                # ===== NEW: 平仓后取消止损单 =====
                 if trade_state.long_state.stop_order_id:
                     cancel_stop_order(FUTURES_SYMBOL, trade_state.long_state.stop_order_id)
             else:
@@ -691,19 +796,18 @@ def force_close_invalid_trend_positions(current_trend: int, current_price: float
             trade_state.reset_side("long")
             main_logger.info(Fore.YELLOW + "⏸️ Long force close done")
     if short_info['size'] > 0:
-        trade_state.short_state.is_trend_valid = not (current_trend == 1 and trade_state.short_state.trend_at_open == -1)
-        main_logger.info(Fore.CYAN + f"🧮 Short trend validity | Current VWT trend:{current_trend} | Open trend:{trade_state.short_state.trend_at_open} | Valid:{trade_state.short_state.is_trend_valid}")
+        trade_state.short_state.is_trend_valid = not (filtered_trend == 1 and trade_state.short_state.trend_at_open == -1)
+        main_logger.info(Fore.CYAN + f"🧮 Short trend validity | Current filtered trend:{filtered_trend} | Open trend:{trade_state.short_state.trend_at_open} | Valid:{trade_state.short_state.is_trend_valid}")
         if not trade_state.short_state.is_trend_valid:
-            main_logger.warning(Fore.YELLOW + "⚠️ Short trend invalid (VWT turned bullish), force close short position!")
+            main_logger.warning(Fore.YELLOW + "⚠️ Short trend invalid (filtered trend turned bullish), force close short position!")
             main_logger.info(Fore.GREEN + f"\n{'='*80}")
-            main_logger.info(Fore.GREEN + "🟢 [Force Close Short] VWT trend reversed")
-            main_logger.info(Fore.GREEN + f"Reason: Current VWT trend ({current_trend}) vs open trend ({trade_state.short_state.trend_at_open})")
+            main_logger.info(Fore.GREEN + "🟢 [Force Close Short] Filtered trend reversed")
+            main_logger.info(Fore.GREEN + f"Reason: Current filtered trend ({filtered_trend}) vs open trend ({trade_state.short_state.trend_at_open})")
             main_logger.info(Fore.GREEN + f"Close Quantity: {short_info['size']} | Current Price: {current_price:.2f}")
             main_logger.info(Fore.GREEN + f"{'='*80}\n")
             close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
             if close_order:
                 signal_logger.info(f"[Force Close Short] Qty: {short_info['size']} @ {current_price:.2f}")
-                # ===== NEW: 平仓后取消止损单 =====
                 if trade_state.short_state.stop_order_id:
                     cancel_stop_order(FUTURES_SYMBOL, trade_state.short_state.stop_order_id)
             else:
@@ -711,22 +815,38 @@ def force_close_invalid_trend_positions(current_trend: int, current_price: float
             trade_state.reset_side("short")
             main_logger.info(Fore.YELLOW + "⏸️ Short force close done")
 
-# ===== NEW: 更新移动止损的函数（基于ATR） =====
+def close_all_positions_if_neutral(filtered_trend: int, current_price: float):
+    """
+    当过滤趋势为中性（灰色）时，立即平掉所有方向持仓
+    """
+    if filtered_trend != 0:
+        return
+    long_info, short_info = get_position(FUTURES_SYMBOL)
+    if long_info['size'] > 0:
+        main_logger.warning(Fore.YELLOW + "⚠️ Filtered trend turned neutral (gray), closing long position!")
+        close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, long_info['size'], 'LONG')
+        if close_order:
+            signal_logger.info(f"[Neutral Close Long] Qty: {long_info['size']} @ {current_price:.2f}")
+            if trade_state.long_state.stop_order_id:
+                cancel_stop_order(FUTURES_SYMBOL, trade_state.long_state.stop_order_id)
+        trade_state.reset_side("long")
+    if short_info['size'] > 0:
+        main_logger.warning(Fore.YELLOW + "⚠️ Filtered trend turned neutral (gray), closing short position!")
+        close_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, short_info['size'], 'SHORT')
+        if close_order:
+            signal_logger.info(f"[Neutral Close Short] Qty: {short_info['size']} @ {current_price:.2f}")
+            if trade_state.short_state.stop_order_id:
+                cancel_stop_order(FUTURES_SYMBOL, trade_state.short_state.stop_order_id)
+        trade_state.reset_side("short")
+
 def update_trailing_stops(symbol: str, current_price: float, current_atr: float):
-    """根据最新价格和ATR更新移动止损单"""
     if not ENABLE_TRAILING_STOP:
         return
-
-    # 处理多头
     long_info, _ = get_position(symbol)
     if long_info['size'] > 0:
-        # 更新最高价
         if current_price > trade_state.long_state.highest_since_entry:
             trade_state.long_state.highest_since_entry = current_price
-        # 计算新的止损价：最高价 - ATR * 系数
         new_stop = trade_state.long_state.highest_since_entry - current_atr * TRAILING_ATR_MULT
-        # 只有当新止损价高于当前止损价时才更新（否则保持不变）
-        # 需要获取当前止损单的触发价（如果存在）
         current_stop = None
         if trade_state.long_state.stop_order_id:
             try:
@@ -737,14 +857,10 @@ def update_trailing_stops(symbol: str, current_price: float, current_atr: float)
         if current_stop is None or new_stop > current_stop:
             main_logger.info(Fore.CYAN + f"🔄 Updating LONG trailing stop: {current_stop} -> {new_stop:.2f} (high={trade_state.long_state.highest_since_entry:.2f}, ATR={current_atr:.2f})")
             update_trailing_stop(symbol, 'LONG', new_stop, long_info['size'])
-
-    # 处理空头
     _, short_info = get_position(symbol)
     if short_info['size'] > 0:
-        # 更新最低价
         if current_price < trade_state.short_state.lowest_since_entry:
             trade_state.short_state.lowest_since_entry = current_price
-        # 新止损价：最低价 + ATR * 系数
         new_stop = trade_state.short_state.lowest_since_entry + current_atr * TRAILING_ATR_MULT
         current_stop = None
         if trade_state.short_state.stop_order_id:
@@ -757,14 +873,14 @@ def update_trailing_stops(symbol: str, current_price: float, current_atr: float)
             main_logger.info(Fore.CYAN + f"🔄 Updating SHORT trailing stop: {current_stop} -> {new_stop:.2f} (low={trade_state.short_state.lowest_since_entry:.2f}, ATR={current_atr:.2f})")
             update_trailing_stop(symbol, 'SHORT', new_stop, short_info['size'])
 
-# ———————————————— 主策略循环（VWT 信号） ————————————————
+# ———————————————— 主策略循环 ————————————————
 def run_strategy():
     main_logger.info(Fore.CYAN + "="*80)
-    main_logger.info(Fore.CYAN + "🚀 VWT Trend Strategy (霓虹发光指标) Started")
+    main_logger.info(Fore.CYAN + "🚀 VWT + L1 Filter Strategy (夜樱过滤版) Started")
     main_logger.info(Fore.CYAN + f"📊 Signal source: {SPOT_SYMBOL} spot klines | Trading on: {FUTURES_SYMBOL} futures")
-    main_logger.info(Fore.CYAN + f"⚙️  VWT Params: VWMA Length={VWMA_LENGTH} | ATR Multiplier={VWT_ATR_MULT}")
+    main_logger.info(Fore.CYAN + f"⚙️  Filter Params: confirm_bars={TREND_CONFIRM_BARS}, consensus={USE_CONSENSUS_FILTER}, atr_filter={USE_ATR_FILTER}")
     main_logger.info(Fore.CYAN + f"💰  Risk Mgmt: Leverage={LEVERAGE}x | Initial Entry={RISK_PERCENTAGE}% | Add Ratio={ADD_RISK_PCT}%")
-    main_logger.info(Fore.CYAN + f"🛡️  Trailing Stop: Enabled={ENABLE_TRAILING_STOP} | ATR Mult={TRAILING_ATR_MULT} (Exchange STOP_MARKET)")
+    main_logger.info(Fore.CYAN + f"🛡️  Trailing Stop: Enabled={ENABLE_TRAILING_STOP} | ATR Mult={TRAILING_ATR_MULT}")
     main_logger.info(Fore.CYAN + "="*80)
 
     try:
@@ -828,8 +944,8 @@ def run_strategy():
                     last_kline_time = 0
                     kline_update_retries = 0
                 else:
-                    main_logger.warning(Fore.YELLOW + f"⚠️ Spot kline not updated, waiting 30s (retry {kline_update_retries}/{MAX_KLINE_RETRIES})")
-                    time.sleep(30)
+                    main_logger.warning(Fore.YELLOW + f"⚠️ Spot kline not updated, waiting 10s (retry {kline_update_retries}/{MAX_KLINE_RETRIES})")
+                    time.sleep(10)
                     continue
             else:
                 kline_update_retries = 0
@@ -840,40 +956,39 @@ def run_strategy():
 
             if pd.isna(current_price_spot):
                 main_logger.error(Fore.RED + "❌ Current spot price is NaN, skip this round")
-                time.sleep(30)
+                time.sleep(10)
                 continue
 
-            # 3. 计算 VWT 趋势和通道
+            # 3. 计算过滤趋势
             if len(df) < VWMA_LENGTH + 1:
                 main_logger.error(Fore.RED + f"❌ Insufficient spot kline data: {len(df)} < {VWMA_LENGTH + 1}")
-                time.sleep(30)
+                time.sleep(10)
                 continue
 
-            current_trend, prev_trend, vwma_val, upper_band, lower_band = calculate_vwt_trend(df, VWMA_LENGTH, VWT_ATR_MULT)
-
-            # 计算当前ATR（用于移动止损）
-            current_atr = calculate_atr_rma(df, VWMA_LENGTH).iloc[-1]
+            filtered_trend, prev_filtered_trend, vwt_trend, l1_trend, current_atr_pct, upper_band, lower_band, vwma_val = calculate_filtered_trend(
+                df, VWMA_LENGTH, VWT_ATR_MULT, L1_ATR_MULT, L1_MU,
+                TREND_CONFIRM_BARS, USE_CONSENSUS_FILTER, USE_ATR_FILTER, MIN_ATR_PCT
+            )
+            current_atr = current_atr_pct * current_price_spot  # 转换为绝对ATR用于移动止损
 
             # 4. 检测流动性区域
             liq_zones = detect_liquidity_zones(df, lookback_len=LIQ_SWEEP_LENGTH)
             res_text = f"{liq_zones['resistance']:.2f}" if not np.isnan(liq_zones['resistance']) else "None"
             sup_text = f"{liq_zones['support']:.2f}" if not np.isnan(liq_zones['support']) else "None"
 
-            # 5. 趋势不一致强制平仓（基于 VWT）
-            force_close_invalid_trend_positions(current_trend, current_price_spot)
-
-            # 获取合约当前仓位
+            # 5. 获取当前仓位
             long_info, short_info = get_position(FUTURES_SYMBOL)
 
             # 日志输出
+            trend_color_str = {1: Fore.GREEN + 'LONG', -1: Fore.RED + 'SHORT', 0: Fore.WHITE + 'NEUTRAL'}[filtered_trend]
             main_logger.info(Fore.CYAN + "="*60)
             main_logger.info(Fore.CYAN + f"🕐 Spot kline close time: {kline_time} | Spot close: {current_price_spot:.2f}")
-            main_logger.info(Fore.CYAN + f"📊 VWT: basis={vwma_val:.2f} | upper={upper_band:.2f} | lower={lower_band:.2f}")
-            main_logger.info(Fore.CYAN + f"🧭 VWT Trend: Current={current_trend} | Previous={prev_trend}")
+            main_logger.info(Fore.CYAN + f"📊 VWMA: {vwma_val:.2f} | Upper: {upper_band:.2f} | Lower: {lower_band:.2f}")
+            main_logger.info(Fore.CYAN + f"🧭 Filtered Trend: {filtered_trend} ({trend_color_str}) | Prev: {prev_filtered_trend} | VWT: {vwt_trend} | L1: {l1_trend} | ATR%: {current_atr_pct:.4f}")
             main_logger.info(Fore.CYAN + f"📈 Long position (futures): Size={long_info['size']} | Avg Price={long_info['entry_price']:.2f} | Trend valid={trade_state.long_state.is_trend_valid}")
             main_logger.info(Fore.CYAN + f"📉 Short position (futures): Size={short_info['size']} | Avg Price={short_info['entry_price']:.2f} | Trend valid={trade_state.short_state.is_trend_valid}")
 
-            # 6. 固定止损检查（保留，可与移动止损并存）
+            # 6. 固定止损检查（保持不变）
             sl_triggered, sl_side = check_stop_loss(FUTURES_SYMBOL, current_price_spot)
             if sl_triggered:
                 if sl_side == "long" and long_info['size'] > 0:
@@ -892,18 +1007,23 @@ def run_strategy():
                 time.sleep(60)
                 continue
 
-            # ===== MODIFIED: 移动止损检查（改为更新交易所止损单） =====
+            # 7. 移动止损更新（保持不变）
             if ENABLE_TRAILING_STOP:
                 update_trailing_stops(FUTURES_SYMBOL, current_price_spot, current_atr)
 
-            # 7. 部分止盈和加仓
-            long_info, short_info = get_position(FUTURES_SYMBOL)
-            check_partial_take_profit(FUTURES_SYMBOL, current_price_spot, liq_zones)
-            check_breakout_and_add(FUTURES_SYMBOL, current_price_spot, liq_zones, current_trend)
+            # 8. 中性趋势平仓（新增：过滤趋势为0时平所有仓位）
+            close_all_positions_if_neutral(filtered_trend, current_price_spot)
 
-            # 8. VWT 趋势反转开仓信号
-            signal_open_long = (current_trend == 1) and (prev_trend != 1)  # 趋势转为看涨
-            signal_open_short = (current_trend == -1) and (prev_trend != -1)  # 趋势转为看跌
+            # 9. 强制平仓（基于过滤趋势，已修改）
+            force_close_invalid_trend_positions(filtered_trend, current_price_spot)
+
+            # 10. 部分止盈和加仓
+            check_partial_take_profit(FUTURES_SYMBOL, current_price_spot, liq_zones)
+            check_breakout_and_add(FUTURES_SYMBOL, current_price_spot, liq_zones, filtered_trend)
+
+            # 11. 开仓信号（基于过滤趋势的变化）
+            signal_open_long = (filtered_trend == 1) and (prev_filtered_trend != 1)
+            signal_open_short = (filtered_trend == -1) and (prev_filtered_trend != -1)
             
             main_logger.info(Fore.YELLOW + f"🚨 Entry signals | Long: {signal_open_long} | Short: {signal_open_short}")
             
@@ -913,14 +1033,13 @@ def run_strategy():
             # 开多头仓
             if signal_open_long and adjusted_qty > 0:
                 main_logger.info(Fore.GREEN + "\n" + "="*80)
-                main_logger.info(Fore.GREEN + f"🟢 [Long Signal Triggered] VWT turned bullish: {prev_trend}→{current_trend}")
+                main_logger.info(Fore.GREEN + f"🟢 [Long Signal Triggered] Filtered trend turned bullish: {prev_filtered_trend}→{filtered_trend}")
                 main_logger.info(Fore.GREEN + f"Planned entry: {adjusted_qty} @ {current_price_spot:.2f} (approx)")
                 main_logger.info(Fore.GREEN + "="*80 + "\n")
                 open_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_BUY, adjusted_qty, 'LONG')
                 if open_order:
                     new_long, _ = get_position(FUTURES_SYMBOL)
-                    trade_state.long_state.init_new_position(new_long['size'], new_long['entry_price'], current_trend)
-                    # ===== NEW: 开仓后立即下初始止损单 =====
+                    trade_state.long_state.init_new_position(new_long['size'], new_long['entry_price'], filtered_trend)
                     if ENABLE_TRAILING_STOP:
                         initial_stop = new_long['entry_price'] - current_atr * TRAILING_ATR_MULT
                         stop_order = place_stop_order(FUTURES_SYMBOL, Client.SIDE_SELL, new_long['size'], initial_stop, 'LONG')
@@ -933,14 +1052,13 @@ def run_strategy():
             # 开空头仓
             elif signal_open_short and adjusted_qty > 0:
                 main_logger.info(Fore.RED + "\n" + "="*80)
-                main_logger.info(Fore.RED + f"🔴 [Short Signal Triggered] VWT turned bearish: {prev_trend}→{current_trend}")
+                main_logger.info(Fore.RED + f"🔴 [Short Signal Triggered] Filtered trend turned bearish: {prev_filtered_trend}→{filtered_trend}")
                 main_logger.info(Fore.RED + f"Planned entry: {adjusted_qty} @ {current_price_spot:.2f} (approx)")
                 main_logger.info(Fore.RED + "="*80 + "\n")
                 open_order = place_market_order(FUTURES_SYMBOL, Client.SIDE_SELL, adjusted_qty, 'SHORT')
                 if open_order:
                     _, new_short = get_position(FUTURES_SYMBOL)
-                    trade_state.short_state.init_new_position(new_short['size'], new_short['entry_price'], current_trend)
-                    # ===== NEW: 开仓后立即下初始止损单 =====
+                    trade_state.short_state.init_new_position(new_short['size'], new_short['entry_price'], filtered_trend)
                     if ENABLE_TRAILING_STOP:
                         initial_stop = new_short['entry_price'] + current_atr * TRAILING_ATR_MULT
                         stop_order = place_stop_order(FUTURES_SYMBOL, Client.SIDE_BUY, new_short['size'], initial_stop, 'SHORT')
