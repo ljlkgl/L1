@@ -98,7 +98,7 @@ STATE_RESET_DELAY = 1
 
 # Trailing Stop Configuration
 ENABLE_TRAILING_STOP = True
-TRAILING_ATR_MULT = 0.6
+TRAILING_ATR_MULT = 0.8
 
 # ===== 止损单相关配置 =====
 STOP_ORDER_TYPE = "STOP_MARKET"            # 止损单类型
@@ -1082,4 +1082,5 @@ if __name__ == "__main__":
     try:
         run_strategy()
     except KeyboardInterrupt:
+
         main_logger.info(Fore.CYAN + "👋 Strategy manually stopped")
