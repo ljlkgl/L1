@@ -53,7 +53,7 @@ load_dotenv()
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 
-SPOT_SYMBOL = "ETHUSDT"          # 现货K线源
+SPOT_SYMBOL = "ETHUSDC"          # 现货K线源
 FUTURES_SYMBOL = "ETHUSDC"       # 合约交易对
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE   # 改为5分钟
 LOOKBACK = 600
@@ -81,19 +81,9 @@ RISK_PERCENTAGE = 50
 STOP_LOSS_PCT = 1.5
 ENABLE_STOP_LOSS = False
 
-# 流动性扫盘参数
-LIQ_SWEEP_LENGTH = 8
-LIQ_PARTIAL_PROFIT_RATIO = 0.5
-BREAKOUT_CONFIRM_BARS = 2
-BREAKOUT_THRESHOLD_PCT = 0.1
-
-# 状态管理
-NEW_ZONE_THRESHOLD_PCT = 0.5
-STATE_RESET_DELAY = 1
-
 # 移动止损
 ENABLE_TRAILING_STOP = True
-TRAILING_ATR_MULT = 1.2
+TRAILING_ATR_MULT = 1.5
 
 # 止损单类型
 STOP_ORDER_TYPE = "STOP_MARKET"
@@ -117,11 +107,6 @@ class SideState:
     initial_entry_price: float = 0.0
     trend_at_open: int = 0          # 开仓时的过滤趋势：1=看涨，-1=看跌
     is_trend_valid: bool = False
-    last_operated_zone_price: float = 0.0
-    has_partial_tp_in_zone: bool = False
-    has_added_in_zone: bool = False
-    total_add_times: int = 0        # 已废弃，但保留用于兼容
-    last_add_price: float = 0.0     # 已废弃
     highest_since_entry: float = 0.0
     lowest_since_entry: float = 0.0
     stop_order_id: Optional[int] = None
@@ -135,11 +120,6 @@ class SideState:
         self.initial_entry_price = 0.0
         self.trend_at_open = 0
         self.is_trend_valid = False
-        self.last_operated_zone_price = 0.0
-        self.has_partial_tp_in_zone = False
-        self.has_added_in_zone = False
-        self.total_add_times = 0
-        self.last_add_price = 0.0
         self.highest_since_entry = 0.0
         self.lowest_since_entry = 0.0
         self.stop_order_id = None
@@ -159,22 +139,6 @@ class SideState:
     def update_position(self, pos_size: float, entry_price: float):
         self.position_size = pos_size
         self.entry_price = entry_price
-
-    def is_new_liquidity_zone(self, current_zone_price: float, pos_dir: str) -> bool:
-        if self.last_operated_zone_price == 0:
-            return True
-        diff_pct = abs(current_zone_price - self.last_operated_zone_price) / self.last_operated_zone_price * 100
-        if pos_dir == "long":
-            is_new = (current_zone_price > self.last_operated_zone_price) and (diff_pct >= NEW_ZONE_THRESHOLD_PCT)
-        elif pos_dir == "short":
-            is_new = (current_zone_price < self.last_operated_zone_price) and (diff_pct >= NEW_ZONE_THRESHOLD_PCT)
-        else:
-            is_new = False
-        if is_new:
-            self.has_partial_tp_in_zone = False
-            self.has_added_in_zone = False
-            main_logger.info(Fore.CYAN + f"🎯 New liquidity zone | Price:{current_zone_price:.2f} | Diff:{diff_pct:.2f}%")
-        return is_new
 
 @dataclass
 class TradeState:
@@ -281,40 +245,6 @@ latest_z_value = 0.0
 latest_filtered_trend = 0
 latest_price = 0.0
 latest_atr = 0.0
-
-# ==================== 流动性区域检测 ====================
-def detect_liquidity_zones(data: pd.DataFrame, lookback: int = 8) -> dict:
-    df = data.copy()
-    closed = df.iloc[:-1].copy()
-    nearest_res, nearest_sup = np.nan, np.nan
-    if len(closed) < lookback * 2 + 1:
-        return {'resistance': nearest_res, 'support': nearest_sup}
-    closed['is_pivot_high'] = closed['high'] == closed['high'].rolling(lookback*2+1, center=True).max()
-    closed['is_pivot_low'] = closed['low'] == closed['low'].rolling(lookback*2+1, center=True).min()
-    pivot_highs = closed[closed['is_pivot_high']]['high']
-    pivot_lows = closed[closed['is_pivot_low']]['low']
-    cur_price = df['close'].iloc[-1]
-    if not pivot_highs.empty:
-        valid = pivot_highs[pivot_highs > cur_price]
-        if not valid.empty:
-            nearest_res = valid.iloc[-1]
-    if not pivot_lows.empty:
-        valid = pivot_lows[pivot_lows < cur_price]
-        if not valid.empty:
-            nearest_sup = valid.iloc[-1]
-    return {'resistance': nearest_res, 'support': nearest_sup}
-
-def confirm_breakout(data: pd.DataFrame, zone_price: float, pos_dir: str) -> bool:
-    if len(data) < BREAKOUT_CONFIRM_BARS:
-        return False
-    recent = data.iloc[-(BREAKOUT_CONFIRM_BARS+1):-1]
-    if pos_dir == "long":
-        level = zone_price * (1 + BREAKOUT_THRESHOLD_PCT/100)
-        return all(recent['close'] > level)
-    elif pos_dir == "short":
-        level = zone_price * (1 - BREAKOUT_THRESHOLD_PCT/100)
-        return all(recent['close'] < level)
-    return False
 
 # ==================== 交易辅助函数 ====================
 def setup_hedge_mode(symbol: str):
@@ -507,6 +437,19 @@ def check_stop_loss(symbol: str, price: float) -> Tuple[bool, str]:
     return False, "none"
 
 def restore_trade_state():
+    # 清理无对应持仓的止损单
+    try:
+        open_orders = client.futures_get_open_orders(symbol=FUTURES_SYMBOL)
+        long_info, short_info = get_position(FUTURES_SYMBOL)
+        for order in open_orders:
+            if order['type'] == STOP_ORDER_TYPE:
+                pos_side = order['positionSide']
+                if (pos_side == 'LONG' and long_info['size'] == 0) or \
+                   (pos_side == 'SHORT' and short_info['size'] == 0):
+                    cancel_stop_order(FUTURES_SYMBOL, int(order['orderId']))
+    except Exception as e:
+        main_logger.error(Fore.RED + f"❌ Cleanup lingering stop orders failed: {e}")
+
     long_info, short_info = get_position(FUTURES_SYMBOL)
     if long_info['size'] > 0:
         trade_state.long_state.init_new_position(long_info['size'], long_info['entry_price'], 1)
@@ -522,41 +465,6 @@ def restore_trade_state():
         trade_state.reset_all()
     restore_stop_orders(FUTURES_SYMBOL)
 
-def check_partial_take_profit(symbol: str, price: float, zones: dict):
-    long_info, short_info = get_position(symbol)
-    qty_prec = get_precision(symbol)[1]
-    min_qty = float(client.futures_exchange_info()['symbols'][0]['filters'][1]['minQty'])
-
-    if long_info['size'] > 0 and trade_state.long_state.is_trend_valid and not np.isnan(zones['resistance']):
-        zone = zones['resistance']
-        if trade_state.long_state.is_new_liquidity_zone(zone, "long"):
-            if price >= zone and not trade_state.long_state.has_partial_tp_in_zone and long_info['size'] > min_qty:
-                qty = round(long_info['size'] * LIQ_PARTIAL_PROFIT_RATIO, qty_prec)
-                qty = max(qty, min_qty)
-                main_logger.info(Fore.MAGENTA + f"🎯 Long partial TP at {zone:.2f} | Qty: {qty}")
-                order = place_market_order(symbol, Client.SIDE_SELL, qty, 'LONG')
-                if order:
-                    trade_state.long_state.has_partial_tp_in_zone = True
-                    trade_state.long_state.last_operated_zone_price = zone
-                    new_long, _ = get_position(symbol)
-                    trade_state.long_state.update_position(new_long['size'], new_long['entry_price'])
-                    signal_logger.info(f"[Long Partial TP] {qty} @ {price} | Remain: {new_long['size']}")
-
-    if short_info['size'] > 0 and trade_state.short_state.is_trend_valid and not np.isnan(zones['support']):
-        zone = zones['support']
-        if trade_state.short_state.is_new_liquidity_zone(zone, "short"):
-            if price <= zone and not trade_state.short_state.has_partial_tp_in_zone and short_info['size'] > min_qty:
-                qty = round(short_info['size'] * LIQ_PARTIAL_PROFIT_RATIO, qty_prec)
-                qty = max(qty, min_qty)
-                main_logger.info(Fore.MAGENTA + f"🎯 Short partial TP at {zone:.2f} | Qty: {qty}")
-                order = place_market_order(symbol, Client.SIDE_BUY, qty, 'SHORT')
-                if order:
-                    trade_state.short_state.has_partial_tp_in_zone = True
-                    trade_state.short_state.last_operated_zone_price = zone
-                    _, new_short = get_position(symbol)
-                    trade_state.short_state.update_position(new_short['size'], new_short['entry_price'])
-                    signal_logger.info(f"[Short Partial TP] {qty} @ {price} | Remain: {new_short['size']}")
-
 def force_close_invalid_trend(filtered: int, price: float):
     long_info, short_info = get_position(FUTURES_SYMBOL)
     if long_info['size'] > 0:
@@ -568,6 +476,7 @@ def force_close_invalid_trend(filtered: int, price: float):
             if close_order:
                 if trade_state.long_state.stop_order_id:
                     cancel_stop_order(FUTURES_SYMBOL, trade_state.long_state.stop_order_id)
+                cancel_all_stop_orders(FUTURES_SYMBOL, 'LONG')
                 signal_logger.info(f"[Force Close Long] @ {price}")
             trade_state.reset_side("long")
     if short_info['size'] > 0:
@@ -579,6 +488,7 @@ def force_close_invalid_trend(filtered: int, price: float):
             if close_order:
                 if trade_state.short_state.stop_order_id:
                     cancel_stop_order(FUTURES_SYMBOL, trade_state.short_state.stop_order_id)
+                cancel_all_stop_orders(FUTURES_SYMBOL, 'SHORT')
                 signal_logger.info(f"[Force Close Short] @ {price}")
             trade_state.reset_side("short")
 
@@ -592,6 +502,7 @@ def close_all_if_neutral(filtered: int, price: float):
         if close_order:
             if trade_state.long_state.stop_order_id:
                 cancel_stop_order(FUTURES_SYMBOL, trade_state.long_state.stop_order_id)
+            cancel_all_stop_orders(FUTURES_SYMBOL, 'LONG')
             signal_logger.info(f"[Neutral Close Long] @ {price}")
         trade_state.reset_side("long")
     if short_info['size'] > 0:
@@ -600,46 +511,51 @@ def close_all_if_neutral(filtered: int, price: float):
         if close_order:
             if trade_state.short_state.stop_order_id:
                 cancel_stop_order(FUTURES_SYMBOL, trade_state.short_state.stop_order_id)
+            cancel_all_stop_orders(FUTURES_SYMBOL, 'SHORT')
             signal_logger.info(f"[Neutral Close Short] @ {price}")
         trade_state.reset_side("short")
 
-def update_trailing_stops(symbol: str, price: float, atr_val: float):
+# ==================== 价格线程中的移动止损更新 ====================
+def check_trailing_stop_in_thread(price: float):
+    """在价格线程中检查并更新移动止损（持有 trade_lock 时调用）"""
     if not ENABLE_TRAILING_STOP:
         return
-    long_info, _ = get_position(symbol)
-    if long_info['size'] > 0:
+    global latest_atr
+    # 多头移动止损
+    if trade_state.long_state.position_size > 0:
         if price > trade_state.long_state.highest_since_entry:
             trade_state.long_state.highest_since_entry = price
-        new_stop = trade_state.long_state.highest_since_entry - atr_val * TRAILING_ATR_MULT
+        new_stop = trade_state.long_state.highest_since_entry - latest_atr * TRAILING_ATR_MULT
         cur_stop = None
         if trade_state.long_state.stop_order_id:
             try:
-                order = client.futures_get_order(symbol=symbol, orderId=trade_state.long_state.stop_order_id)
+                order = client.futures_get_order(symbol=FUTURES_SYMBOL, orderId=trade_state.long_state.stop_order_id)
                 cur_stop = float(order['stopPrice'])
             except:
                 pass
         if cur_stop is None or new_stop > cur_stop:
-            main_logger.info(Fore.CYAN + f"🔄 Update LONG trailing stop: {cur_stop} -> {new_stop:.2f}")
-            update_trailing_stop(symbol, 'LONG', new_stop, long_info['size'])
-    _, short_info = get_position(symbol)
-    if short_info['size'] > 0:
+            main_logger.info(Fore.CYAN + f"🔄 [Thread] Update LONG trailing stop: {cur_stop} -> {new_stop:.2f}")
+            update_trailing_stop(FUTURES_SYMBOL, 'LONG', new_stop, trade_state.long_state.position_size)
+
+    # 空头移动止损
+    if trade_state.short_state.position_size > 0:
         if price < trade_state.short_state.lowest_since_entry:
             trade_state.short_state.lowest_since_entry = price
-        new_stop = trade_state.short_state.lowest_since_entry + atr_val * TRAILING_ATR_MULT
+        new_stop = trade_state.short_state.lowest_since_entry + latest_atr * TRAILING_ATR_MULT
         cur_stop = None
         if trade_state.short_state.stop_order_id:
             try:
-                order = client.futures_get_order(symbol=symbol, orderId=trade_state.short_state.stop_order_id)
+                order = client.futures_get_order(symbol=FUTURES_SYMBOL, orderId=trade_state.short_state.stop_order_id)
                 cur_stop = float(order['stopPrice'])
             except:
                 pass
         if cur_stop is None or new_stop < cur_stop:
-            main_logger.info(Fore.CYAN + f"🔄 Update SHORT trailing stop: {cur_stop} -> {new_stop:.2f}")
-            update_trailing_stop(symbol, 'SHORT', new_stop, short_info['size'])
+            main_logger.info(Fore.CYAN + f"🔄 [Thread] Update SHORT trailing stop: {cur_stop} -> {new_stop:.2f}")
+            update_trailing_stop(FUTURES_SYMBOL, 'SHORT', new_stop, trade_state.short_state.position_size)
 
 # ==================== 价格线程（REST 轮询） ====================
 def price_polling():
-    """独立线程，每秒轮询一次合约最新价格，并检查开仓条件"""
+    """独立线程，每秒轮询一次合约最新价格，并检查开仓条件 + 更新移动止损"""
     global latest_price
     main_logger.info(Fore.CYAN + f"📡 启动价格轮询线程，交易对: {FUTURES_SYMBOL}，间隔 1 秒")
     while True:
@@ -648,7 +564,8 @@ def price_polling():
             price = float(ticker['price'])
             with trade_lock:
                 latest_price = price
-                check_price_trigger(price)
+                check_price_trigger(price)          # 原有的价格触发开仓逻辑
+                check_trailing_stop_in_thread(price) # 新增：移动止损更新
         except Exception as e:
             main_logger.error(Fore.RED + f"❌ 价格轮询错误: {e}")
         time.sleep(1)
@@ -797,9 +714,6 @@ def run_strategy():
                 latest_filtered_trend = filtered
                 latest_atr = atr_val
 
-            # 检测流动性区域
-            zones = detect_liquidity_zones(df, LIQ_SWEEP_LENGTH)
-
             # 获取当前仓位
             long_info, short_info = get_position(FUTURES_SYMBOL)
 
@@ -828,18 +742,13 @@ def run_strategy():
                 time.sleep(60)
                 continue
 
-            # 移动止损
-            if ENABLE_TRAILING_STOP:
-                update_trailing_stops(FUTURES_SYMBOL, cur_price, atr_val)
+            # 注意：移动止损更新已移至价格线程，此处不再调用 update_trailing_stops
 
             # 中性平仓
             close_all_if_neutral(filtered, cur_price)
 
             # 强制平仓
             force_close_invalid_trend(filtered, cur_price)
-
-            # 部分止盈
-            check_partial_take_profit(FUTURES_SYMBOL, cur_price, zones)
 
             # ========== 新入场逻辑：直接价格判断 + K线触碰判断 ==========
             with trade_lock:
@@ -863,11 +772,9 @@ def run_strategy():
                                         trade_state.long_state.stop_order_id = int(stop_order['orderId'])
                                 signal_logger.info(f"[Long Direct Entry] {qty} @ {cur_price}")
                                 entered = True
-                        # 无论是否成功开仓，都不再等待
                         if entered:
-                            # 清除可能存在的等待标志
                             trade_state.long_state.awaiting_entry = False
-                    # 2. 当前价格 > z, 但本根K线最低曾 <= z -> 立即开多（K线曾触及）
+                    # 2. 当前价格 > z, 但本根K线最低曾 <= z -> 立即开多
                     elif cur_low <= z_val:
                         main_logger.info(Fore.GREEN + f"⚡ K线最低 {cur_low:.2f} <= z {z_val:.2f} (当前价 {cur_price:.2f}), 立即 LONG entry")
                         usdc = get_usdc_balance()
@@ -886,9 +793,8 @@ def run_strategy():
                                 entered = True
                         if entered:
                             trade_state.long_state.awaiting_entry = False
-                    # 3. 如果以上都不满足，则按原逻辑设置等待标志（由价格线程处理）
+                    # 3. 否则设置等待
                     else:
-                        # 只有在之前没有设置过等待时才设置
                         if not trade_state.long_state.awaiting_entry:
                             trade_state.long_state.awaiting_entry = True
                             trade_state.long_state.awaiting_trend = 1
