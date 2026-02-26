@@ -82,7 +82,7 @@ STOP_LOSS_PCT = 1.5
 ENABLE_STOP_LOSS = False
 
 # 移动止损
-ENABLE_TRAILING_STOP = True
+ENABLE_TRAILING_STOP = False
 TRAILING_ATR_MULT = 1.5
 
 # 止损单类型
@@ -865,4 +865,5 @@ if __name__ == "__main__":
     try:
         run_strategy()
     except KeyboardInterrupt:
+
         main_logger.info(Fore.CYAN + "👋 Strategy stopped")
