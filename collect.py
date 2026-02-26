@@ -751,15 +751,17 @@ async def handle_fut_mark_price_socket(symbol, msg):
         return
     REAL_TIME_CACHE[symbol]["funding_rate"] = float(msg["r"])
 
-# ======================== 轮询任务（保留） ========================
+# ======================== 轮询任务（添加异常保护） ========================
 async def update_open_interest(symbol):
     while True:
         try:
             oi_data = await async_client.futures_open_interest(symbol=symbol)
             if oi_data:
                 REAL_TIME_CACHE[symbol]["open_interest"] = float(oi_data["openInterest"])
+        except asyncio.CancelledError:
+            break  # 正常退出
         except Exception as e:
-            print(f"[{symbol}] OI update failed: {e}")
+            print(f"[{symbol}] OI update failed: {e}, retry in 60s...")
         await asyncio.sleep(60)
 
 async def update_long_short(symbol):
@@ -770,72 +772,119 @@ async def update_long_short(symbol):
             )
             if ls_data:
                 REAL_TIME_CACHE[symbol]["long_short_ratio"] = float(ls_data[0]["longShortRatio"])
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            print(f"[{symbol}] Long/Short ratio update failed: {e}")
+            print(f"[{symbol}] Long/Short ratio update failed: {e}, retry in 60s...")
         await asyncio.sleep(60)
 
-# ======================== WebSocket订阅（双轨流整合） ========================
+# ======================== WebSocket订阅（添加自动重连） ========================
 async def subscribe_symbol_streams(symbol, bm):
-    """订阅单个币种的【期货流+现货流】"""
-    # --- 现货流任务（新增）---
+    """订阅单个币种的【期货流+现货流】，每个流自带重连逻辑"""
+    # --- 现货流任务（新增重连）---
     async def spot_kline_task():
-        spot_kline_socket = bm.kline_socket(symbol=symbol, interval=TIMEFRAME)
+        conn_id = f"{BinanceSocketType.SPOT}_{symbol.lower()}@kline_{TIMEFRAME}"
         while True:
-            msg = await spot_kline_socket.recv()
-            await handle_spot_kline_socket(symbol, msg)
+            try:
+                socket = bm.kline_socket(symbol=symbol, interval=TIMEFRAME)
+                while True:
+                    msg = await socket.recv()
+                    await handle_spot_kline_socket(symbol, msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[{symbol} Spot Kline] Error: {e}, reconnecting in 5s...")
+                await bm._stop_socket(conn_id)  # 清理旧连接
+                await asyncio.sleep(5)
 
     async def spot_depth_task():
-        spot_depth_socket = bm.depth_socket(symbol=symbol, depth="10", interval=100)
+        conn_id = f"{BinanceSocketType.SPOT}_{symbol.lower()}@depth10@100ms"
         while True:
-            msg = await spot_depth_socket.recv()
-            await handle_spot_depth_socket(symbol, msg)
+            try:
+                socket = bm.depth_socket(symbol=symbol, depth="10", interval=100)
+                while True:
+                    msg = await socket.recv()
+                    await handle_spot_depth_socket(symbol, msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[{symbol} Spot Depth] Error: {e}, reconnecting in 5s...")
+                await bm._stop_socket(conn_id)
+                await asyncio.sleep(5)
 
     # --- 期货流任务（保留并修正）---
     async def fut_kline_task():
-        fut_kline_socket = bm.kline_futures_socket(
-            symbol=symbol,
-            interval=TIMEFRAME,
-            futures_type=FuturesType.USD_M,
-            contract_type=ContractType.PERPETUAL
-        )
+        path = f"{symbol.lower()}_PERPETUAL@continuousKline_{TIMEFRAME}"
+        conn_id = f"{BinanceSocketType.USD_M_FUTURES}_{path}"
         while True:
-            msg = await fut_kline_socket.recv()
-            await handle_fut_kline_socket(symbol, msg)
+            try:
+                socket = bm.kline_futures_socket(
+                    symbol=symbol,
+                    interval=TIMEFRAME,
+                    futures_type=FuturesType.USD_M,
+                    contract_type=ContractType.PERPETUAL
+                )
+                while True:
+                    msg = await socket.recv()
+                    await handle_fut_kline_socket(symbol, msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[{symbol} Futures Kline] Error: {e}, reconnecting in 5s...")
+                await bm._stop_socket(conn_id)
+                await asyncio.sleep(5)
 
     async def fut_depth_task():
-        fut_depth_socket = bm.futures_depth_socket(
-            symbol=symbol,
-            depth="10",
-            futures_type=FuturesType.USD_M
-        )
+        path = f"{symbol.lower()}@depth10"
+        conn_id = f"{BinanceSocketType.USD_M_FUTURES}_{path}"
         while True:
-            msg = await fut_depth_socket.recv()
-            await handle_fut_depth_socket(symbol, msg)
+            try:
+                socket = bm.futures_depth_socket(
+                    symbol=symbol,
+                    depth="10",
+                    futures_type=FuturesType.USD_M
+                )
+                while True:
+                    msg = await socket.recv()
+                    await handle_fut_depth_socket(symbol, msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[{symbol} Futures Depth] Error: {e}, reconnecting in 5s...")
+                await bm._stop_socket(conn_id)
+                await asyncio.sleep(5)
 
     async def fut_mark_price_task():
-        mark_socket = bm.symbol_mark_price_socket(
-            symbol=symbol,
-            fast=False,
-            futures_type=FuturesType.USD_M
-        )
+        path = f"{symbol.lower()}@markPrice"
+        conn_id = f"{BinanceSocketType.USD_M_FUTURES}_{path}"
         while True:
-            msg = await mark_socket.recv()
-            await handle_fut_mark_price_socket(symbol, msg)
+            try:
+                socket = bm.symbol_mark_price_socket(
+                    symbol=symbol,
+                    fast=False,
+                    futures_type=FuturesType.USD_M
+                )
+                while True:
+                    msg = await socket.recv()
+                    await handle_fut_mark_price_socket(symbol, msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[{symbol} Futures Mark Price] Error: {e}, reconnecting in 5s...")
+                await bm._stop_socket(conn_id)
+                await asyncio.sleep(5)
 
-    # --- 轮询任务 ---
+    # --- 轮询任务（已在上方函数内添加异常保护）---
     oi_task = update_open_interest(symbol)
     ls_task = update_long_short(symbol)
 
     # 返回所有任务
     return [
-        # 现货任务
         asyncio.create_task(spot_kline_task()),
         asyncio.create_task(spot_depth_task()),
-        # 期货任务
         asyncio.create_task(fut_kline_task()),
         asyncio.create_task(fut_depth_task()),
         asyncio.create_task(fut_mark_price_task()),
-        # 轮询任务
         asyncio.create_task(oi_task),
         asyncio.create_task(ls_task)
     ]
@@ -879,9 +928,9 @@ async def main():
     for symbol in SYMBOL_LIST:
         symbol_tasks = await subscribe_symbol_streams(symbol, bm)
         all_tasks.extend(symbol_tasks)
-    
+
     print(f"Subscribed to {len(SYMBOL_LIST)} symbols (Futures + Spot). Collecting data...")
-    print(f"Note: Need 60 K-lines (≈15 hours) for first valid sample.")
+    print(f"Note: Need 60 K-lines (≈15 hours) for first valid sample.")  # 修正为60
 
     try:
         await asyncio.gather(*all_tasks)
