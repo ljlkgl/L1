@@ -1,18 +1,17 @@
 import asyncio
 import pandas as pd
 import numpy as np
-import time
 import glob
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from binance.client import Client
 from binance import AsyncClient, BinanceSocketManager
-from binance.exceptions import BinanceAPIException, BinanceWebsocketUnableToConnect
+from binance.exceptions import BinanceWebsocketUnableToConnect
 
 # ==============================================
 # Core Configuration (CSV Collection Only)
 # ==============================================
-SYMBOL_LIST = ["BTCUSDT", "ETHUSDT"]
+SYMBOL_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 TIMEFRAME = Client.KLINE_INTERVAL_15MINUTE
 LABEL_WINDOW = 3
 LONG_THRESHOLD = 0.005
@@ -26,11 +25,10 @@ BOLL_PERIOD = 20
 CSV_FILE_PREFIX = "./"
 CSV_FILE_TPL = f"{CSV_FILE_PREFIX}{{:03d}}.csv"
 
-# Global real-time data cache
+# Global real-time data cache (移除 liquidation_buffer)
 REAL_TIME_CACHE = {symbol: {
     "kline_buffer": [],
     "depth_buffer": [],
-    "liquidation_buffer": [],  # Renamed from force_order_buffer
     "open_interest": 0,
     "long_short_ratio": 0,
     "funding_rate": 0,
@@ -94,7 +92,7 @@ def init_csv_file():
         print(f"No existing files found, created new CSV file: {CURRENT_CSV_FILE}")
 
 # ==============================================
-# Feature Calculation
+# Feature Calculation (移除爆仓相关特征)
 # ==============================================
 def calculate_rsi(prices, period):
     deltas = np.diff(prices)
@@ -127,6 +125,7 @@ def calculate_features(df):
     low = df["low"].values
     volume = df["volume"].values
 
+    # 1. Technical factors (5)
     df["rsi_14"] = calculate_rsi(close, RSI_PERIOD)
     df["ema_fast"] = df["close"].ewm(span=MACD_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=MACD_SLOW, adjust=False).mean()
@@ -142,13 +141,15 @@ def calculate_features(df):
     df["volume_3d_mean"] = df["volume"].rolling(288).mean()
     df["volume_ratio"] = df["volume"] / (df["volume_3d_mean"] + 1e-10)
 
+    # 2. Perpetual micro factors (5，移除爆仓相关，补充taker_volume_ratio)
     df["order_imbalance"] = df["order_imbalance"]
     df["taker_ratio"] = (df["taker_buy_base"] - df["taker_sell_base"]) / (df["volume"] + 1e-10)
-    df["liquidation_vol_ratio"] = df["liquidation_vol"] / (df["volume"] + 1e-10)  # Renamed from force_vol_ratio
+    df["taker_volume_ratio"] = (df["taker_buy_base"] + df["taker_sell_base"]) / (df["volume"] + 1e-10)  # 新增特征补位
     df["oi_change"] = df["oi"].pct_change(fill_method=None)
     df["oi_volume_ratio"] = df["oi"] / (df["volume"] + 1e-10)
     df["cancel_ratio"] = df["cancel_ratio"]
 
+    # 3. Funding rate factors (4)
     df["funding_rate_3d_mean"] = df["funding_rate"].rolling(288).mean()
     df["funding_rate_30d_mean"] = df["funding_rate"].rolling(2880).mean()
     df["funding_dev"] = df["funding_rate"] - df["funding_rate_30d_mean"]
@@ -156,6 +157,7 @@ def calculate_features(df):
     df["funding_switch"] = df["funding_sign"].diff().abs()
     df["funding_switch_3d"] = df["funding_switch"].rolling(288).sum()
 
+    # 4. Market sentiment factors (5)
     df["ls_ratio_30d_mean"] = df["long_short_ratio"].rolling(2880).mean()
     df["ls_ratio_dev"] = df["long_short_ratio"] - df["ls_ratio_30d_mean"]
     df["stablecoin_inflow"] = df["quote_volume"].pct_change(fill_method=None).rolling(24).mean()
@@ -164,9 +166,10 @@ def calculate_features(df):
     df["atr_30d_rank"] = df["atr_14"].rolling(2880).rank(pct=True)
     df["market_sentiment"] = np.where(df["close"].pct_change() > 0, 1, 0).rolling(100).mean()
 
+    # 20个特征列（移除liquidation_vol_ratio，新增taker_volume_ratio补位）
     feature_cols = [
         "rsi_14", "macd_diff", "boll_width", "atr_14", "volume_ratio",
-        "order_imbalance", "taker_ratio", "liquidation_vol_ratio", "oi_change", "oi_volume_ratio", "cancel_ratio",
+        "order_imbalance", "taker_ratio", "taker_volume_ratio", "oi_change", "oi_volume_ratio", "cancel_ratio",
         "funding_rate", "funding_rate_3d_mean", "funding_dev", "funding_switch_3d",
         "ls_ratio_dev", "stablecoin_inflow", "basis_ratio", "atr_30d_rank", "market_sentiment"
     ]
@@ -187,7 +190,7 @@ def calculate_label_for_sample(sample, future_close):
         return np.nan, np.abs(future_return)
 
 # ==============================================
-# Message Handling
+# Message Handling (移除爆仓数据处理函数)
 # ==============================================
 async def handle_kline_socket(symbol, msg):
     if msg.get("e") != "kline" or not msg.get("k", {}).get("x"):
@@ -196,6 +199,7 @@ async def handle_kline_socket(symbol, msg):
     timestamp = pd.to_datetime(kline_data["t"], unit="ms", utc=True)
     cache = REAL_TIME_CACHE[symbol]
 
+    # 移除 liquidation_vol 字段
     kline_row = {
         "timestamp": timestamp,
         "open": float(kline_data["o"]),
@@ -223,8 +227,6 @@ async def handle_kline_socket(symbol, msg):
         kline_row["order_imbalance"] = 0
         kline_row["cancel_ratio"] = 0
 
-    kline_row["liquidation_vol"] = sum([x["volume"] for x in cache["liquidation_buffer"]])  # Renamed from force_vol
-
     try:
         spot_ticker = await async_client.get_symbol_ticker(symbol=symbol)
         kline_row["spot_close"] = float(spot_ticker["price"])
@@ -238,14 +240,13 @@ async def handle_kline_socket(symbol, msg):
     if len(cache["kline_buffer"]) < 60:
         print(f"[{symbol}] Accumulating K-lines: {len(cache['kline_buffer'])}/60, cannot calculate features yet")
         cache["depth_buffer"] = []
-        cache["liquidation_buffer"] = []  # Renamed from force_order_buffer
         return
 
     kline_df = pd.DataFrame(cache["kline_buffer"])
     kline_df, feature_cols = calculate_features(kline_df)
     current_sample = kline_df.iloc[-1].to_dict()
 
-    # --- Real-time CSV save (Core Fix) ---
+    # 实时保存CSV
     is_header = not os.path.exists(CURRENT_CSV_FILE)
     pd.DataFrame([current_sample]).to_csv(
         CURRENT_CSV_FILE,
@@ -269,11 +270,9 @@ async def handle_kline_socket(symbol, msg):
         future_close = current_sample["close"]
         label, conf_label = calculate_label_for_sample(target_sample, future_close)
         if not np.isnan(label):
-            # Update label in CSV (optional, or keep as separate column)
             print(f"[{symbol}] Label backfilled: {'Long' if label ==1 else 'Short'}, confidence: {conf_label:.4f}")
 
     cache["depth_buffer"] = []
-    cache["liquidation_buffer"] = []  # Renamed from force_order_buffer
 
 async def handle_depth_socket(symbol, msg):
     if msg.get("e") != "depthUpdate":
@@ -300,14 +299,6 @@ async def handle_depth_socket(symbol, msg):
         "cancel_volume": cancel_volume
     })
 
-async def handle_liquidation_socket(symbol, msg):  # Renamed from handle_force_order_socket
-    if msg.get("e") != "forceOrder" or msg.get("o", {}).get("s") != symbol:
-        return
-    REAL_TIME_CACHE[symbol]["liquidation_buffer"].append({  # Renamed from force_order_buffer
-        "volume": float(msg["o"]["q"]),
-        "side": msg["o"]["S"]
-    })
-
 async def handle_open_interest_socket(symbol, msg):
     if msg.get("e") != "openInterest":
         return
@@ -319,39 +310,38 @@ async def handle_funding_rate_socket(symbol, msg):
     REAL_TIME_CACHE[symbol]["funding_rate"] = float(msg["r"])
 
 # ==============================================
-# WebSocket Subscription (Fixed Method Names)
+# WebSocket Subscription (移除爆仓流订阅)
 # ==============================================
 async def subscribe_symbol_streams(symbol, bm):
+    # K线流任务
     async def kline_task():
         async with bm.kline_socket(symbol=symbol, interval=TIMEFRAME) as stream:
             while True:
                 msg = await stream.recv()
                 await handle_kline_socket(symbol, msg)
 
+    # 深度流任务
     async def depth_task():
         async with bm.depth_socket(symbol=symbol, depth="100ms") as stream:
             while True:
                 msg = await stream.recv()
                 await handle_depth_socket(symbol, msg)
 
-    async def liquidation_task():  # Renamed from force_order_task
-        async with bm.liquidation_socket(symbol=symbol) as stream:  # Fixed method name
-            while True:
-                msg = await stream.recv()
-                await handle_liquidation_socket(symbol, msg)  # Renamed handler
-
+    # 未平仓量流任务
     async def open_interest_task():
         async with bm.open_interest_socket(symbol=symbol) as stream:
             while True:
                 msg = await stream.recv()
                 await handle_open_interest_socket(symbol, msg)
 
+    # 资金费率流任务
     async def mark_price_task():
         async with bm.mark_price_socket(symbol=symbol, fast=False) as stream:
             while True:
                 msg = await stream.recv()
                 await handle_funding_rate_socket(symbol, msg)
 
+    # 多空比定时更新
     async def update_long_short():
         while True:
             try:
@@ -364,10 +354,10 @@ async def subscribe_symbol_streams(symbol, bm):
                 pass
             await asyncio.sleep(60)
 
+    # 移除 liquidation_task 相关代码
     return [
         asyncio.create_task(kline_task()),
         asyncio.create_task(depth_task()),
-        asyncio.create_task(liquidation_task()),  # Renamed from force_order_task
         asyncio.create_task(open_interest_task()),
         asyncio.create_task(mark_price_task()),
         asyncio.create_task(update_long_short())
@@ -406,7 +396,7 @@ async def safe_shutdown(all_tasks, bm):
 async def main():
     global async_client
     print("="*60)
-    print("Binance Perpetual Contract CSV Collection Script (Fixed Method Names + Real-time Save)")
+    print("Binance Perpetual Contract CSV Collection Script (No Liquidation Data)")
     print("DISCLAIMER: This script is for technical research only, not investment advice")
     print("="*60)
 
