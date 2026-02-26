@@ -3,17 +3,14 @@ import pandas as pd
 import numpy as np
 import glob
 import os
-import logging
 from datetime import datetime
 from binance.client import Client
 from binance import AsyncClient
-from binance.enums import FuturesType, ContractType
-from binance.exceptions import BinanceWebsocketUnableToConnect
 
-# ======================== 配置项（保持不变） ========================
+# ======================== 配置项 ========================
 SYMBOL_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 TIMEFRAME = Client.KLINE_INTERVAL_15MINUTE
-LABEL_WINDOW = 5
+LABEL_WINDOW = 3
 LONG_THRESHOLD = 0.005
 SHORT_THRESHOLD = -0.005
 RSI_PERIOD = 14
@@ -24,9 +21,8 @@ MACD_SIGNAL = 9
 BOLL_PERIOD = 20
 CSV_FILE_PREFIX = "./"
 CSV_FILE_TPL = f"{CSV_FILE_PREFIX}{{:03d}}.csv"
-MAX_QUEUE_SIZE = 2000  # 不再使用，但保留
 
-# ======================== 全局缓存（保持不变） ========================
+# ======================== 全局缓存 ========================
 REAL_TIME_CACHE = {symbol: {
     # 期货永续数据
     "fut_kline_buffer": [],
@@ -48,7 +44,7 @@ REAL_TIME_CACHE = {symbol: {
 CURRENT_CSV_FILE = ""
 async_client = None
 
-# ======================== CSV文件管理（保持不变） ========================
+# ======================== CSV文件管理 ========================
 def get_latest_numeric_file():
     file_list = glob.glob(f"{CSV_FILE_PREFIX}*.csv")
     if not file_list:
@@ -99,7 +95,7 @@ def init_csv_file():
         CURRENT_CSV_FILE = get_next_numeric_file()
         print(f"No existing files found, created new CSV file: {CURRENT_CSV_FILE}")
 
-# ======================== 特征计算（保持不变） ========================
+# ======================== 特征计算 ========================
 def calculate_rsi(prices, period):
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
@@ -196,9 +192,9 @@ def calculate_label_for_sample(sample, future_close):
     else:
         return np.nan, np.abs(future_return)
 
-# ======================== 消息处理（保持不变，由轮询函数调用） ========================
+# ======================== 数据处理函数（被轮询任务调用） ========================
 async def handle_spot_kline_socket(symbol, msg):
-    """处理现货K线数据（由轮询任务调用，msg为模拟的字典）"""
+    """处理现货K线数据（由轮询任务调用）"""
     if msg.get("e") != "kline" or not msg.get("k", {}).get("x"):
         return
     kline_data = msg["k"]
@@ -217,11 +213,6 @@ async def handle_spot_kline_socket(symbol, msg):
     if len(cache["spot_kline_buffer"]) > 1000:
         cache["spot_kline_buffer"] = cache["spot_kline_buffer"][-1000:]
     cache["spot_latest_kline"] = spot_kline
-
-async def handle_spot_depth_socket(symbol, msg):
-    """处理现货深度数据（由轮询任务调用，msg为模拟字典，但此处不再使用，因为深度轮询直接更新缓存）"""
-    # 此函数在轮询模式下不再被调用，深度更新由 poll_spot_depth 直接操作缓存
-    pass
 
 async def handle_fut_kline_socket(symbol, msg):
     """处理期货K线数据（由轮询任务调用）"""
@@ -316,15 +307,7 @@ async def handle_fut_kline_socket(symbol, msg):
     # 清空当期期货深度缓存
     cache["fut_depth_buffer"] = []
 
-async def handle_fut_depth_socket(symbol, msg):
-    """处理期货深度数据（由轮询任务调用，但此处不再使用，深度轮询直接更新缓存）"""
-    pass
-
-async def handle_fut_mark_price_socket(symbol, msg):
-    """处理资金费率数据（由轮询任务调用，但此处不再使用，轮询直接更新缓存）"""
-    pass
-
-# ======================== 轮询任务（新） ========================
+# ======================== 轮询任务 ========================
 async def poll_spot_klines(symbol):
     """轮询现货K线"""
     global async_client
@@ -333,7 +316,6 @@ async def poll_spot_klines(symbol):
             klines = await async_client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=1)
             if klines:
                 k = klines[0]
-                # 构造模拟消息
                 msg = {
                     "e": "kline",
                     "k": {
@@ -365,12 +347,10 @@ async def poll_spot_depth(symbol):
             bid1_vol = float(depth['bids'][0][1]) if depth['bids'] else 0.0
             ask1_vol = float(depth['asks'][0][1]) if depth['asks'] else 0.0
 
-            # 计算变化量
             add_volume = max(0.0, bid1_vol - last_bid1_vol) + max(0.0, ask1_vol - last_ask1_vol)
             cancel_volume = max(0.0, last_bid1_vol - bid1_vol) + max(0.0, last_ask1_vol - ask1_vol)
             order_imbalance = (bid1_vol - ask1_vol) / (bid1_vol + ask1_vol + 1e-10)
 
-            # 更新缓存
             cache = REAL_TIME_CACHE[symbol]
             cache["spot_last_bid_vol"] = bid1_vol
             cache["spot_last_ask_vol"] = ask1_vol
@@ -379,7 +359,6 @@ async def poll_spot_depth(symbol):
                 "spot_add_volume": add_volume,
                 "spot_cancel_volume": cancel_volume
             })
-            # 限制缓存大小（可选）
             if len(cache["spot_depth_buffer"]) > 1000:
                 cache["spot_depth_buffer"] = cache["spot_depth_buffer"][-1000:]
 
@@ -446,7 +425,6 @@ async def poll_fut_depth(symbol):
                 "fut_add_volume": add_volume,
                 "fut_cancel_volume": cancel_volume
             })
-            # 限制缓存大小（可选）
             if len(cache["fut_depth_buffer"]) > 1000:
                 cache["fut_depth_buffer"] = cache["fut_depth_buffer"][-1000:]
 
@@ -457,19 +435,22 @@ async def poll_fut_depth(symbol):
             print(f"[{symbol}] Futures Depth poll error: {e}")
         await asyncio.sleep(1)
 
-async def poll_fut_mark_price(symbol):
-    """轮询期货资金费率"""
+async def poll_fut_funding_rate(symbol):
+    """轮询期货资金费率（官方专用接口）"""
     global async_client
     while True:
         try:
-            mark_price_data = await async_client.futures_mark_price(symbol=symbol)
-            if mark_price_data:
-                REAL_TIME_CACHE[symbol]["funding_rate"] = float(mark_price_data['fundingRate'])
+            funding_data = await async_client.futures_funding_rate(
+                symbol=symbol,
+                limit=1
+            )
+            if funding_data and len(funding_data) > 0:
+                REAL_TIME_CACHE[symbol]["funding_rate"] = float(funding_data[0]['fundingRate'])
         except Exception as e:
-            print(f"[{symbol}] Mark Price poll error: {e}")
-        await asyncio.sleep(3)
+            print(f"[{symbol}] Funding rate poll error: {e}")
+        await asyncio.sleep(60)  # 资金费率每小时更新，60秒轮询足够
 
-# ======================== 原有轮询任务（保持不变） ========================
+# ======================== 原有轮询任务（不变） ========================
 async def update_open_interest(symbol):
     while True:
         try:
@@ -492,7 +473,7 @@ async def update_long_short(symbol):
             print(f"[{symbol}] Long/Short ratio update failed: {e}")
         await asyncio.sleep(60)
 
-# ======================== 安全退出（移除WebSocket相关） ========================
+# ======================== 安全退出 ========================
 async def safe_shutdown(all_tasks):
     print("\nInitiating safe shutdown...")
     for task in all_tasks:
@@ -520,12 +501,11 @@ async def main():
 
     all_tasks = []
     for symbol in SYMBOL_LIST:
-        # 启动所有轮询任务
         all_tasks.append(asyncio.create_task(poll_spot_klines(symbol)))
         all_tasks.append(asyncio.create_task(poll_spot_depth(symbol)))
         all_tasks.append(asyncio.create_task(poll_fut_klines(symbol)))
         all_tasks.append(asyncio.create_task(poll_fut_depth(symbol)))
-        all_tasks.append(asyncio.create_task(poll_fut_mark_price(symbol)))
+        all_tasks.append(asyncio.create_task(poll_fut_funding_rate(symbol)))
         all_tasks.append(asyncio.create_task(update_open_interest(symbol)))
         all_tasks.append(asyncio.create_task(update_long_short(symbol)))
 
