@@ -10,389 +10,10 @@ from binance import AsyncClient
 from binance.enums import FuturesType, ContractType
 from binance.exceptions import BinanceWebsocketUnableToConnect
 
-# ======================== 导入你提供的官方SocketManager源码 ========================
-from enum import Enum
-from typing import Optional, List, Dict, Callable, Any
-from binance.ws.constants import KEEPALIVE_TIMEOUT
-from binance.ws.keepalive_websocket import KeepAliveWebsocket
-from binance.ws.reconnecting_websocket import ReconnectingWebsocket
-from binance.ws.threaded_stream import ThreadedApiManager
-from binance.helpers import get_loop
-
-class BinanceSocketType(str, Enum):
-    SPOT = "Spot"
-    USD_M_FUTURES = "USD_M_Futures"
-    COIN_M_FUTURES = "Coin_M_Futures"
-    OPTIONS = "Vanilla_Options"
-    ACCOUNT = "Account"
-
-class BinanceSocketManager:
-    STREAM_URL = "wss://stream.binance.{}:9443/"
-    STREAM_TESTNET_URL = "wss://stream.testnet.binance.vision/"
-    STREAM_DEMO_URL = "wss://demo-stream.binance.com/"
-    FSTREAM_URL = "wss://fstream.binance.{}/"
-    FSTREAM_TESTNET_URL = "wss://stream.binancefuture.com/"
-    FSTREAM_DEMO_URL = "wss://fstream.binancefuture.com/"
-    DSTREAM_URL = "wss://dstream.binance.{}/"
-    DSTREAM_TESTNET_URL = "wss://dstream.binancefuture.com/"
-    DSTREAM_DEMO_URL = "wss://dstream.binancefuture.com/"
-    OPTIONS_URL = "wss://nbstream.binance.{}/eoptions/"
-
-    WEBSOCKET_DEPTH_5 = "5"
-    WEBSOCKET_DEPTH_10 = "10"
-    WEBSOCKET_DEPTH_20 = "20"
-
-    def __init__(
-        self,
-        client: AsyncClient,
-        user_timeout=KEEPALIVE_TIMEOUT,
-        max_queue_size: int = 100,
-        verbose: bool = False,
-    ):
-        self.STREAM_URL = self.STREAM_URL.format(client.tld)
-        self.FSTREAM_URL = self.FSTREAM_URL.format(client.tld)
-        self.DSTREAM_URL = self.DSTREAM_URL.format(client.tld)
-        self.OPTIONS_URL = self.OPTIONS_URL.format(client.tld)
-
-        self._conns = {}
-        self._loop = get_loop()
-        self._client = client
-        self._user_timeout = user_timeout
-        self.testnet = self._client.testnet
-        self.demo = self._client.demo
-        self._max_queue_size = max_queue_size
-        self.verbose = verbose
-        self.ws_kwargs = {}
-
-        if verbose:
-            logging.getLogger('binance.ws').setLevel(logging.DEBUG)
-
-    def _get_stream_url(self, stream_url: Optional[str] = None):
-        if stream_url:
-            return stream_url
-        stream_url = self.STREAM_URL
-        if self.testnet:
-            stream_url = self.STREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.STREAM_DEMO_URL
-        return stream_url
-
-    def _get_socket(
-        self,
-        path: str,
-        stream_url: Optional[str] = None,
-        prefix: str = "ws/",
-        is_binary: bool = False,
-        socket_type: BinanceSocketType = BinanceSocketType.SPOT,
-    ) -> ReconnectingWebsocket:
-        conn_id = f"{socket_type}_{path}"
-        time_unit = getattr(self._client, "TIME_UNIT", None)
-        if time_unit:
-            path = f"{path}?timeUnit={time_unit}"
-        if conn_id not in self._conns:
-            self._conns[conn_id] = ReconnectingWebsocket(
-                path=path,
-                url=self._get_stream_url(stream_url),
-                prefix=prefix,
-                exit_coro=lambda p: self._exit_socket(f"{socket_type}_{p}"),
-                is_binary=is_binary,
-                https_proxy=self._client.https_proxy,
-                max_queue_size=self._max_queue_size,** self.ws_kwargs,
-            )
-
-        return self._conns[conn_id]
-
-    def _get_account_socket(
-        self,
-        path: str,
-        stream_url: Optional[str] = None,
-        prefix: str = "ws/",
-        is_binary: bool = False,
-    ) -> KeepAliveWebsocket:
-        conn_id = f"{BinanceSocketType.ACCOUNT}_{path}"
-        if conn_id not in self._conns:
-            self._conns[conn_id] = KeepAliveWebsocket(
-                client=self._client,
-                url=self._get_stream_url(stream_url),
-                keepalive_type=path,
-                prefix=prefix,
-                exit_coro=lambda p: self._exit_socket(conn_id),
-                is_binary=is_binary,
-                user_timeout=self._user_timeout,
-                https_proxy=self._client.https_proxy,
-                max_queue_size=self._max_queue_size,
-                **self.ws_kwargs,
-            )
-
-        return self._conns[conn_id]
-
-    def _get_futures_socket(
-        self, path: str, futures_type: FuturesType, prefix: str = "stream?streams="
-    ):
-        socket_type: BinanceSocketType = BinanceSocketType.USD_M_FUTURES
-        if futures_type == FuturesType.USD_M:
-            stream_url = self.FSTREAM_URL
-            if self.testnet:
-                stream_url = self.FSTREAM_TESTNET_URL
-            elif self.demo:
-                stream_url = self.FSTREAM_DEMO_URL
-        else:
-            stream_url = self.DSTREAM_URL
-            if self.testnet:
-                stream_url = self.DSTREAM_TESTNET_URL
-            elif self.demo:
-                stream_url = self.DSTREAM_DEMO_URL
-        return self._get_socket(path, stream_url, prefix, socket_type=socket_type)
-
-    def _get_options_socket(self, path: str, prefix: str = "ws/"):
-        stream_url = self.OPTIONS_URL
-        return self._get_socket(
-            path,
-            stream_url,
-            prefix,
-            is_binary=False,
-            socket_type=BinanceSocketType.OPTIONS,
-        )
-
-    async def _exit_socket(self, path: str):
-        await self._stop_socket(path)
-
-    def depth_socket(
-        self, symbol: str, depth: Optional[str] = None, interval: Optional[int] = None
-    ):
-        socket_name = symbol.lower() + "@depth"
-        if depth and depth != "1":
-            socket_name = f"{socket_name}{depth}"
-        if interval:
-            if interval in [0, 100]:
-                socket_name = f"{socket_name}@{interval}ms"
-            else:
-                raise ValueError(
-                    "Websocket interval value not allowed. Allowed values are [0, 100]"
-                )
-        return self._get_socket(socket_name)
-
-    def kline_socket(self, symbol: str, interval=AsyncClient.KLINE_INTERVAL_1MINUTE):
-        path = f"{symbol.lower()}@kline_{interval}"
-        return self._get_socket(path)
-
-    def kline_futures_socket(
-        self,
-        symbol: str,
-        interval=AsyncClient.KLINE_INTERVAL_1MINUTE,
-        futures_type: FuturesType = FuturesType.USD_M,
-        contract_type: ContractType = ContractType.PERPETUAL,
-    ):
-        path = f"{symbol.lower()}_{contract_type.value}@continuousKline_{interval}"
-        return self._get_futures_socket(path, prefix="ws/", futures_type=futures_type)
-
-    def miniticker_socket(self, update_time: int = 1000):
-        return self._get_socket(f"!miniTicker@arr@{update_time}ms")
-
-    def trade_socket(self, symbol: str):
-        return self._get_socket(symbol.lower() + "@trade")
-
-    def aggtrade_socket(self, symbol: str):
-        return self._get_socket(symbol.lower() + "@aggTrade")
-
-    def aggtrade_futures_socket(
-        self, symbol: str, futures_type: FuturesType = FuturesType.USD_M
-    ):
-        return self._get_futures_socket(
-            symbol.lower() + "@aggTrade", futures_type=futures_type
-        )
-
-    def symbol_miniticker_socket(self, symbol: str):
-        return self._get_socket(symbol.lower() + "@miniTicker")
-
-    def symbol_ticker_socket(self, symbol: str):
-        return self._get_socket(symbol.lower() + "@ticker")
-
-    def ticker_socket(self):
-        return self._get_socket("!ticker@arr")
-
-    def futures_ticker_socket(self):
-        return self._get_futures_socket("!ticker@arr", FuturesType.USD_M)
-
-    def futures_coin_ticker_socket(self):
-        return self._get_futures_socket("!ticker@arr", FuturesType.COIN_M)
-
-    def index_price_socket(self, symbol: str, fast: bool = True):
-        stream_name = "@indexPrice@1s" if fast else "@indexPrice"
-        return self._get_futures_socket(
-            symbol.lower() + stream_name, futures_type=FuturesType.COIN_M
-        )
-
-    def symbol_mark_price_socket(
-        self,
-        symbol: str,
-        fast: bool = True,
-        futures_type: FuturesType = FuturesType.USD_M,
-    ):
-        stream_name = "@markPrice@1s" if fast else "@markPrice"
-        return self._get_futures_socket(
-            symbol.lower() + stream_name, futures_type=futures_type
-        )
-
-    def all_mark_price_socket(
-        self, fast: bool = True, futures_type: FuturesType = FuturesType.USD_M
-    ):
-        stream_name = "!markPrice@arr@1s" if fast else "!markPrice@arr"
-        return self._get_futures_socket(stream_name, futures_type=futures_type)
-
-    def symbol_ticker_futures_socket(
-        self, symbol: str, futures_type: FuturesType = FuturesType.USD_M
-    ):
-        return self._get_futures_socket(
-            symbol.lower() + "@bookTicker", futures_type=futures_type
-        )
-
-    def individual_symbol_ticker_futures_socket(
-        self, symbol: str, futures_type: FuturesType = FuturesType.USD_M
-    ):
-        return self._get_futures_socket(
-            symbol.lower() + "@ticker", futures_type=futures_type
-        )
-
-    def all_ticker_futures_socket(
-        self,
-        channel: str = "!bookTicker",
-        futures_type: FuturesType = FuturesType.USD_M,
-    ):
-        return self._get_futures_socket(channel, futures_type=futures_type)
-
-    def symbol_book_ticker_socket(self, symbol: str):
-        return self._get_socket(symbol.lower() + "@bookTicker")
-
-    def book_ticker_socket(self):
-        return self._get_socket("!bookTicker")
-
-    def multiplex_socket(self, streams: List[str]):
-        path = f"streams={'/'.join(streams)}"
-        return self._get_socket(path, prefix="stream?")
-
-    def options_multiplex_socket(self, streams: List[str]):
-        stream_name = "/".join([s for s in streams])
-        stream_path = f"streams={stream_name}"
-        return self._get_options_socket(stream_path, prefix="stream?")
-
-    def futures_multiplex_socket(
-        self, streams: List[str], futures_type: FuturesType = FuturesType.USD_M
-    ):
-        path = f"streams={'/'.join(streams)}"
-        return self._get_futures_socket(
-            path, prefix="stream?", futures_type=futures_type
-        )
-
-    def user_socket(self):
-        stream_url = self.STREAM_URL
-        if self.testnet:
-            stream_url = self.STREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.STREAM_DEMO_URL
-        return self._get_account_socket("user", stream_url=stream_url)
-
-    def futures_user_socket(self):
-        stream_url = self.FSTREAM_URL
-        if self.testnet:
-            stream_url = self.FSTREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.FSTREAM_DEMO_URL
-        return self._get_account_socket("futures", stream_url=stream_url)
-
-    def coin_futures_user_socket(self):
-        return self._get_account_socket("coin_futures", stream_url=self.DSTREAM_URL)
-
-    def margin_socket(self):
-        stream_url = self.STREAM_URL
-        if self.testnet:
-            stream_url = self.STREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.STREAM_DEMO_URL
-        return self._get_account_socket("margin", stream_url=stream_url)
-
-    def futures_socket(self):
-        stream_url = self.FSTREAM_URL
-        if self.testnet:
-            stream_url = self.FSTREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.FSTREAM_DEMO_URL
-        return self._get_account_socket("futures", stream_url=stream_url)
-
-    def coin_futures_socket(self):
-        stream_url = self.DSTREAM_URL
-        if self.testnet:
-            stream_url = self.DSTREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.DSTREAM_DEMO_URL
-        return self._get_account_socket("coin_futures", stream_url=stream_url)
-
-    def portfolio_margin_socket(self):
-        stream_url = self.FSTREAM_URL
-        if self.testnet:
-            stream_url = self.FSTREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.FSTREAM_DEMO_URL
-        stream_url += "pm/"
-        return self._get_account_socket("portfolio_margin", stream_url=stream_url)
-
-    def isolated_margin_socket(self, symbol: str):
-        stream_url = self.STREAM_URL
-        if self.testnet:
-            stream_url = self.STREAM_TESTNET_URL
-        elif self.demo:
-            stream_url = self.STREAM_DEMO_URL
-        return self._get_account_socket(symbol, stream_url=stream_url)
-
-    def options_ticker_socket(self, symbol: str):
-        return self._get_options_socket(symbol.upper() + "@ticker")
-
-    def options_ticker_by_expiration_socket(self, symbol: str, expiration_date: str):
-        return self._get_options_socket(symbol.upper() + "@ticker@" + expiration_date)
-
-    def options_recent_trades_socket(self, symbol: str):
-        return self._get_options_socket(symbol.upper() + "@trade")
-
-    def options_kline_socket(
-        self, symbol: str, interval=AsyncClient.KLINE_INTERVAL_1MINUTE
-    ):
-        return self._get_options_socket(symbol.upper() + "@kline_" + interval)
-
-    def options_depth_socket(self, symbol: str, depth: str = "10"):
-        return self._get_options_socket(symbol.upper() + "@depth" + str(depth))
-
-    def futures_depth_socket(self, symbol: str, depth: str = "10", futures_type=FuturesType.USD_M):
-        return self._get_futures_socket(
-            symbol.lower() + "@depth" + str(depth), futures_type=futures_type
-        )
-
-    def futures_rpi_depth_socket(self, symbol: str, futures_type=FuturesType.USD_M):
-        return self._get_futures_socket(
-            symbol.lower() + "@rpiDepth@500ms", futures_type=futures_type
-        )
-
-    def options_new_symbol_socket(self):
-        return self._get_options_socket("option_pair")
-
-    def options_open_interest_socket(self, symbol: str, expiration_date: str):
-        return self._get_options_socket(symbol.upper() + "@openInterest@" + expiration_date)
-
-    def options_mark_price_socket(self, symbol: str):
-        return self._get_options_socket(symbol.upper() + "@markPrice")
-
-    def options_index_price_socket(self, symbol: str):
-        return self._get_options_socket(symbol.upper() + "@index")
-
-    async def _stop_socket(self, conn_key):
-        if conn_key not in self._conns:
-            return
-        del self._conns[conn_key]
-
-# ======================== 核心业务逻辑（期货+现货双整合） ========================
-# 配置项
+# ======================== 配置项（保持不变） ========================
 SYMBOL_LIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 TIMEFRAME = Client.KLINE_INTERVAL_15MINUTE
-LABEL_WINDOW = 3
+LABEL_WINDOW = 5
 LONG_THRESHOLD = 0.005
 SHORT_THRESHOLD = -0.005
 RSI_PERIOD = 14
@@ -403,9 +24,9 @@ MACD_SIGNAL = 9
 BOLL_PERIOD = 20
 CSV_FILE_PREFIX = "./"
 CSV_FILE_TPL = f"{CSV_FILE_PREFIX}{{:03d}}.csv"
-MAX_QUEUE_SIZE = 2000  # 增大队列，适配双轨流数据
+MAX_QUEUE_SIZE = 2000  # 不再使用，但保留
 
-# 全局缓存（新增现货专属子缓存）
+# ======================== 全局缓存（保持不变） ========================
 REAL_TIME_CACHE = {symbol: {
     # 期货永续数据
     "fut_kline_buffer": [],
@@ -415,19 +36,19 @@ REAL_TIME_CACHE = {symbol: {
     "funding_rate": 0.0,
     "fut_last_bid_vol": 0.0,
     "fut_last_ask_vol": 0.0,
-    # 现货数据（新增）
+    # 现货数据
     "spot_kline_buffer": [],
     "spot_depth_buffer": [],
     "spot_last_bid_vol": 0.0,
     "spot_last_ask_vol": 0.0,
-    "spot_latest_kline": None,  # 存储最新现货闭合K线
+    "spot_latest_kline": None,
     # 标签缓存
     "unlabeled_samples": []
 } for symbol in SYMBOL_LIST}
 CURRENT_CSV_FILE = ""
 async_client = None
 
-# ======================== CSV文件管理（无变化） ========================
+# ======================== CSV文件管理（保持不变） ========================
 def get_latest_numeric_file():
     file_list = glob.glob(f"{CSV_FILE_PREFIX}*.csv")
     if not file_list:
@@ -478,7 +99,7 @@ def init_csv_file():
         CURRENT_CSV_FILE = get_next_numeric_file()
         print(f"No existing files found, created new CSV file: {CURRENT_CSV_FILE}")
 
-# ======================== 特征计算（适配现货实时数据） ========================
+# ======================== 特征计算（保持不变） ========================
 def calculate_rsi(prices, period):
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
@@ -510,7 +131,7 @@ def calculate_features(df):
     fut_high = df["fut_high"].values
     fut_low = df["fut_low"].values
     fut_volume = df["fut_volume"].values
-    # 现货数据列（新增）
+    # 现货数据列
     spot_close = df["spot_close"].values
 
     # 1. 期货技术指标
@@ -544,15 +165,15 @@ def calculate_features(df):
     df["funding_switch"] = df["funding_sign"].diff().abs().fillna(0)
     df["funding_switch_3d"] = df["funding_switch"].rolling(288, min_periods=1).sum()
 
-    # 4. 市场情绪+基差指标（新增现货完整数据）
+    # 4. 市场情绪+基差指标
     df["ls_ratio_dev"] = df["long_short_ratio"] - df["long_short_ratio"].rolling(2880, min_periods=1).mean()
     df["stablecoin_inflow"] = df["fut_quote_volume"].pct_change(fill_method=None).rolling(24, min_periods=1).mean().fillna(0)
-    df["basis"] = df["fut_close"] - df["spot_close"]  # 用现货WS实时收盘价
+    df["basis"] = df["fut_close"] - df["spot_close"]
     df["basis_ratio"] = df["basis"] / df["spot_close"]
     df["atr_30d_rank"] = df["atr_14"].rolling(2880, min_periods=1).rank(pct=True).fillna(0.5)
     df["market_sentiment"] = np.where(df["fut_close"].pct_change() > 0, 1, 0).rolling(100, min_periods=1).mean().fillna(0.5)
 
-    # 20个核心特征列（适配字段名）
+    # 20个核心特征列
     feature_cols = [
         "rsi_14", "macd_diff", "boll_width", "atr_14", "volume_ratio",
         "fut_order_imbalance", "taker_ratio", "taker_volume_ratio", "oi_change", "oi_volume_ratio", "fut_cancel_ratio",
@@ -575,15 +196,13 @@ def calculate_label_for_sample(sample, future_close):
     else:
         return np.nan, np.abs(future_return)
 
-# ======================== 消息处理（期货+现货分离处理） ========================
-# --- 现货消息处理（新增）---
+# ======================== 消息处理（保持不变，由轮询函数调用） ========================
 async def handle_spot_kline_socket(symbol, msg):
-    """处理现货K线流，更新最新现货K线缓存"""
+    """处理现货K线数据（由轮询任务调用，msg为模拟的字典）"""
     if msg.get("e") != "kline" or not msg.get("k", {}).get("x"):
         return
     kline_data = msg["k"]
     cache = REAL_TIME_CACHE[symbol]
-    # 构造现货K线数据
     spot_kline = {
         "spot_timestamp": pd.to_datetime(kline_data["t"], unit="ms", utc=True),
         "spot_open": float(kline_data["o"]),
@@ -594,45 +213,25 @@ async def handle_spot_kline_socket(symbol, msg):
         "spot_quote_volume": float(kline_data["q"]),
         "spot_trades": int(kline_data["n"])
     }
-    # 更新缓存
     cache["spot_kline_buffer"].append(spot_kline)
     if len(cache["spot_kline_buffer"]) > 1000:
         cache["spot_kline_buffer"] = cache["spot_kline_buffer"][-1000:]
-    cache["spot_latest_kline"] = spot_kline  # 存储最新闭合现货K线
+    cache["spot_latest_kline"] = spot_kline
 
 async def handle_spot_depth_socket(symbol, msg):
-    """处理现货深度流，更新现货深度缓存"""
-    if msg.get("e") != "depthUpdate":
-        return
-    bids = msg.get("b", [])
-    asks = msg.get("a", [])
-    if not bids or not asks:
-        return
-    cache = REAL_TIME_CACHE[symbol]
-    bid1_vol = float(bids[0][1])
-    ask1_vol = float(asks[0][1])
-    order_imbalance = (bid1_vol - ask1_vol) / (bid1_vol + ask1_vol + 1e-10)
-    add_volume = max(0.0, bid1_vol - cache["spot_last_bid_vol"]) + max(0.0, ask1_vol - cache["spot_last_ask_vol"])
-    cancel_volume = max(0.0, cache["spot_last_bid_vol"] - bid1_vol) + max(0.0, cache["spot_last_ask_vol"] - ask1_vol)
-    # 更新缓存
-    cache["spot_last_bid_vol"] = bid1_vol
-    cache["spot_last_ask_vol"] = ask1_vol
-    cache["spot_depth_buffer"].append({
-        "spot_order_imbalance": order_imbalance,
-        "spot_add_volume": add_volume,
-        "spot_cancel_volume": cancel_volume
-    })
+    """处理现货深度数据（由轮询任务调用，msg为模拟字典，但此处不再使用，因为深度轮询直接更新缓存）"""
+    # 此函数在轮询模式下不再被调用，深度更新由 poll_spot_depth 直接操作缓存
+    pass
 
-# --- 期货消息处理（适配现货缓存）---
 async def handle_fut_kline_socket(symbol, msg):
-    """处理期货永续K线流，整合现货数据写入CSV"""
+    """处理期货K线数据（由轮询任务调用）"""
     if msg.get("e") != "continuous_kline" or not msg.get("k", {}).get("x"):
         return
     kline_data = msg["k"]
     timestamp = pd.to_datetime(kline_data["t"], unit="ms", utc=True)
     cache = REAL_TIME_CACHE[symbol]
 
-    # 1. 获取最新现货数据（核心：从WS缓存取，不再轮询）
+    # 1. 获取最新现货数据（从缓存）
     spot_latest = cache.get("spot_latest_kline", {})
     spot_close = spot_latest.get("spot_close", float(kline_data["c"]))
     spot_open = spot_latest.get("spot_open", float(kline_data["o"]))
@@ -640,10 +239,9 @@ async def handle_fut_kline_socket(symbol, msg):
     spot_low = spot_latest.get("spot_low", float(kline_data["l"]))
     spot_volume = spot_latest.get("spot_volume", 0.0)
 
-    # 2. 构造期货K线行（字段名加fut_前缀，避免与现货冲突）
+    # 2. 构造期货K线行
     fut_kline_row = {
         "timestamp": timestamp,
-        # 期货基础列
         "fut_open": float(kline_data["o"]),
         "fut_high": float(kline_data["h"]),
         "fut_low": float(kline_data["l"]),
@@ -653,15 +251,12 @@ async def handle_fut_kline_socket(symbol, msg):
         "fut_trades": int(kline_data["n"]),
         "fut_taker_buy_base": float(kline_data["V"]),
         "fut_taker_sell_base": float(kline_data["v"]) - float(kline_data["V"]),
-        # 期货合约列
         "symbol": symbol,
         "oi": cache["open_interest"],
         "long_short_ratio": cache["long_short_ratio"],
         "funding_rate": cache["funding_rate"],
-        # 期货深度列
         "fut_order_imbalance": 0.0,
         "fut_cancel_ratio": 0.0,
-        # 现货完整列（新增）
         "spot_open": spot_open,
         "spot_high": spot_high,
         "spot_low": spot_low,
@@ -693,7 +288,6 @@ async def handle_fut_kline_socket(symbol, msg):
     fut_df, feature_cols = calculate_features(fut_df)
     current_sample = fut_df.iloc[-1].to_dict()
 
-    # 写入CSV
     is_header = not os.path.exists(CURRENT_CSV_FILE)
     pd.DataFrame([current_sample]).to_csv(
         CURRENT_CSV_FILE,
@@ -723,45 +317,167 @@ async def handle_fut_kline_socket(symbol, msg):
     cache["fut_depth_buffer"] = []
 
 async def handle_fut_depth_socket(symbol, msg):
-    """处理期货深度流"""
-    if msg.get("e") != "depthUpdate":
-        return
-    bids = msg.get("b", [])
-    asks = msg.get("a", [])
-    if not bids or not asks:
-        return
-    cache = REAL_TIME_CACHE[symbol]
-    bid1_vol = float(bids[0][1])
-    ask1_vol = float(asks[0][1])
-    order_imbalance = (bid1_vol - ask1_vol) / (bid1_vol + ask1_vol + 1e-10)
-    add_volume = max(0.0, bid1_vol - cache["fut_last_bid_vol"]) + max(0.0, ask1_vol - cache["fut_last_ask_vol"])
-    cancel_volume = max(0.0, cache["fut_last_bid_vol"] - bid1_vol) + max(0.0, cache["fut_last_ask_vol"] - ask1_vol)
-    # 更新期货深度缓存
-    cache["fut_last_bid_vol"] = bid1_vol
-    cache["fut_last_ask_vol"] = ask1_vol
-    cache["fut_depth_buffer"].append({
-        "fut_order_imbalance": order_imbalance,
-        "fut_add_volume": add_volume,
-        "fut_cancel_volume": cancel_volume
-    })
+    """处理期货深度数据（由轮询任务调用，但此处不再使用，深度轮询直接更新缓存）"""
+    pass
 
 async def handle_fut_mark_price_socket(symbol, msg):
-    """处理期货资金费率流"""
-    if msg.get("e") != "markPriceUpdate":
-        return
-    REAL_TIME_CACHE[symbol]["funding_rate"] = float(msg["r"])
+    """处理资金费率数据（由轮询任务调用，但此处不再使用，轮询直接更新缓存）"""
+    pass
 
-# ======================== 轮询任务（添加异常保护） ========================
+# ======================== 轮询任务（新） ========================
+async def poll_spot_klines(symbol):
+    """轮询现货K线"""
+    global async_client
+    while True:
+        try:
+            klines = await async_client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=1)
+            if klines:
+                k = klines[0]
+                # 构造模拟消息
+                msg = {
+                    "e": "kline",
+                    "k": {
+                        "t": k[0],
+                        "o": k[1],
+                        "h": k[2],
+                        "l": k[3],
+                        "c": k[4],
+                        "v": k[5],
+                        "x": True,
+                        "q": k[7],
+                        "n": k[8],
+                        "V": k[9],
+                    }
+                }
+                await handle_spot_kline_socket(symbol, msg)
+        except Exception as e:
+            print(f"[{symbol}] Spot Kline poll error: {e}")
+        await asyncio.sleep(15)
+
+async def poll_spot_depth(symbol):
+    """轮询现货深度（每秒一次）"""
+    global async_client
+    last_bid1_vol = 0.0
+    last_ask1_vol = 0.0
+    while True:
+        try:
+            depth = await async_client.get_order_book(symbol=symbol, limit=10)
+            bid1_vol = float(depth['bids'][0][1]) if depth['bids'] else 0.0
+            ask1_vol = float(depth['asks'][0][1]) if depth['asks'] else 0.0
+
+            # 计算变化量
+            add_volume = max(0.0, bid1_vol - last_bid1_vol) + max(0.0, ask1_vol - last_ask1_vol)
+            cancel_volume = max(0.0, last_bid1_vol - bid1_vol) + max(0.0, last_ask1_vol - ask1_vol)
+            order_imbalance = (bid1_vol - ask1_vol) / (bid1_vol + ask1_vol + 1e-10)
+
+            # 更新缓存
+            cache = REAL_TIME_CACHE[symbol]
+            cache["spot_last_bid_vol"] = bid1_vol
+            cache["spot_last_ask_vol"] = ask1_vol
+            cache["spot_depth_buffer"].append({
+                "spot_order_imbalance": order_imbalance,
+                "spot_add_volume": add_volume,
+                "spot_cancel_volume": cancel_volume
+            })
+            # 限制缓存大小（可选）
+            if len(cache["spot_depth_buffer"]) > 1000:
+                cache["spot_depth_buffer"] = cache["spot_depth_buffer"][-1000:]
+
+            last_bid1_vol = bid1_vol
+            last_ask1_vol = ask1_vol
+
+        except Exception as e:
+            print(f"[{symbol}] Spot Depth poll error: {e}")
+        await asyncio.sleep(1)
+
+async def poll_fut_klines(symbol):
+    """轮询期货永续K线"""
+    global async_client
+    while True:
+        try:
+            klines = await async_client.futures_continuous_klines(
+                pair=symbol,
+                contractType='PERPETUAL',
+                interval=TIMEFRAME,
+                limit=1
+            )
+            if klines:
+                k = klines[0]
+                msg = {
+                    "e": "continuous_kline",
+                    "k": {
+                        "t": k[0],
+                        "o": k[1],
+                        "h": k[2],
+                        "l": k[3],
+                        "c": k[4],
+                        "v": k[5],
+                        "x": True,
+                        "q": k[7],
+                        "n": k[8],
+                        "V": k[9],
+                    }
+                }
+                await handle_fut_kline_socket(symbol, msg)
+        except Exception as e:
+            print(f"[{symbol}] Futures Kline poll error: {e}")
+        await asyncio.sleep(15)
+
+async def poll_fut_depth(symbol):
+    """轮询期货深度（每秒一次）"""
+    global async_client
+    last_bid1_vol = 0.0
+    last_ask1_vol = 0.0
+    while True:
+        try:
+            depth = await async_client.futures_order_book(symbol=symbol, limit=10)
+            bid1_vol = float(depth['bids'][0][1]) if depth['bids'] else 0.0
+            ask1_vol = float(depth['asks'][0][1]) if depth['asks'] else 0.0
+
+            add_volume = max(0.0, bid1_vol - last_bid1_vol) + max(0.0, ask1_vol - last_ask1_vol)
+            cancel_volume = max(0.0, last_bid1_vol - bid1_vol) + max(0.0, last_ask1_vol - ask1_vol)
+            order_imbalance = (bid1_vol - ask1_vol) / (bid1_vol + ask1_vol + 1e-10)
+
+            cache = REAL_TIME_CACHE[symbol]
+            cache["fut_last_bid_vol"] = bid1_vol
+            cache["fut_last_ask_vol"] = ask1_vol
+            cache["fut_depth_buffer"].append({
+                "fut_order_imbalance": order_imbalance,
+                "fut_add_volume": add_volume,
+                "fut_cancel_volume": cancel_volume
+            })
+            # 限制缓存大小（可选）
+            if len(cache["fut_depth_buffer"]) > 1000:
+                cache["fut_depth_buffer"] = cache["fut_depth_buffer"][-1000:]
+
+            last_bid1_vol = bid1_vol
+            last_ask1_vol = ask1_vol
+
+        except Exception as e:
+            print(f"[{symbol}] Futures Depth poll error: {e}")
+        await asyncio.sleep(1)
+
+async def poll_fut_mark_price(symbol):
+    """轮询期货资金费率"""
+    global async_client
+    while True:
+        try:
+            mark_price_data = await async_client.futures_mark_price(symbol=symbol)
+            if mark_price_data:
+                REAL_TIME_CACHE[symbol]["funding_rate"] = float(mark_price_data['fundingRate'])
+        except Exception as e:
+            print(f"[{symbol}] Mark Price poll error: {e}")
+        await asyncio.sleep(3)
+
+# ======================== 原有轮询任务（保持不变） ========================
 async def update_open_interest(symbol):
     while True:
         try:
             oi_data = await async_client.futures_open_interest(symbol=symbol)
             if oi_data:
                 REAL_TIME_CACHE[symbol]["open_interest"] = float(oi_data["openInterest"])
-        except asyncio.CancelledError:
-            break  # 正常退出
         except Exception as e:
-            print(f"[{symbol}] OI update failed: {e}, retry in 60s...")
+            print(f"[{symbol}] OI update failed: {e}")
         await asyncio.sleep(60)
 
 async def update_long_short(symbol):
@@ -772,125 +488,12 @@ async def update_long_short(symbol):
             )
             if ls_data:
                 REAL_TIME_CACHE[symbol]["long_short_ratio"] = float(ls_data[0]["longShortRatio"])
-        except asyncio.CancelledError:
-            break
         except Exception as e:
-            print(f"[{symbol}] Long/Short ratio update failed: {e}, retry in 60s...")
+            print(f"[{symbol}] Long/Short ratio update failed: {e}")
         await asyncio.sleep(60)
 
-# ======================== WebSocket订阅（添加自动重连） ========================
-async def subscribe_symbol_streams(symbol, bm):
-    """订阅单个币种的【期货流+现货流】，每个流自带重连逻辑"""
-    # --- 现货流任务（新增重连）---
-    async def spot_kline_task():
-        conn_id = f"{BinanceSocketType.SPOT}_{symbol.lower()}@kline_{TIMEFRAME}"
-        while True:
-            try:
-                socket = bm.kline_socket(symbol=symbol, interval=TIMEFRAME)
-                while True:
-                    msg = await socket.recv()
-                    await handle_spot_kline_socket(symbol, msg)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[{symbol} Spot Kline] Error: {e}, reconnecting in 5s...")
-                await bm._stop_socket(conn_id)  # 清理旧连接
-                await asyncio.sleep(5)
-
-    async def spot_depth_task():
-        conn_id = f"{BinanceSocketType.SPOT}_{symbol.lower()}@depth10@100ms"
-        while True:
-            try:
-                socket = bm.depth_socket(symbol=symbol, depth="10", interval=100)
-                while True:
-                    msg = await socket.recv()
-                    await handle_spot_depth_socket(symbol, msg)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[{symbol} Spot Depth] Error: {e}, reconnecting in 5s...")
-                await bm._stop_socket(conn_id)
-                await asyncio.sleep(5)
-
-    # --- 期货流任务（保留并修正）---
-    async def fut_kline_task():
-        path = f"{symbol.lower()}_PERPETUAL@continuousKline_{TIMEFRAME}"
-        conn_id = f"{BinanceSocketType.USD_M_FUTURES}_{path}"
-        while True:
-            try:
-                socket = bm.kline_futures_socket(
-                    symbol=symbol,
-                    interval=TIMEFRAME,
-                    futures_type=FuturesType.USD_M,
-                    contract_type=ContractType.PERPETUAL
-                )
-                while True:
-                    msg = await socket.recv()
-                    await handle_fut_kline_socket(symbol, msg)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[{symbol} Futures Kline] Error: {e}, reconnecting in 5s...")
-                await bm._stop_socket(conn_id)
-                await asyncio.sleep(5)
-
-    async def fut_depth_task():
-        path = f"{symbol.lower()}@depth10"
-        conn_id = f"{BinanceSocketType.USD_M_FUTURES}_{path}"
-        while True:
-            try:
-                socket = bm.futures_depth_socket(
-                    symbol=symbol,
-                    depth="10",
-                    futures_type=FuturesType.USD_M
-                )
-                while True:
-                    msg = await socket.recv()
-                    await handle_fut_depth_socket(symbol, msg)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[{symbol} Futures Depth] Error: {e}, reconnecting in 5s...")
-                await bm._stop_socket(conn_id)
-                await asyncio.sleep(5)
-
-    async def fut_mark_price_task():
-        path = f"{symbol.lower()}@markPrice"
-        conn_id = f"{BinanceSocketType.USD_M_FUTURES}_{path}"
-        while True:
-            try:
-                socket = bm.symbol_mark_price_socket(
-                    symbol=symbol,
-                    fast=False,
-                    futures_type=FuturesType.USD_M
-                )
-                while True:
-                    msg = await socket.recv()
-                    await handle_fut_mark_price_socket(symbol, msg)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"[{symbol} Futures Mark Price] Error: {e}, reconnecting in 5s...")
-                await bm._stop_socket(conn_id)
-                await asyncio.sleep(5)
-
-    # --- 轮询任务（已在上方函数内添加异常保护）---
-    oi_task = update_open_interest(symbol)
-    ls_task = update_long_short(symbol)
-
-    # 返回所有任务
-    return [
-        asyncio.create_task(spot_kline_task()),
-        asyncio.create_task(spot_depth_task()),
-        asyncio.create_task(fut_kline_task()),
-        asyncio.create_task(fut_depth_task()),
-        asyncio.create_task(fut_mark_price_task()),
-        asyncio.create_task(oi_task),
-        asyncio.create_task(ls_task)
-    ]
-
-# ======================== 安全退出（无变化） ========================
-async def safe_shutdown(all_tasks, bm):
+# ======================== 安全退出（移除WebSocket相关） ========================
+async def safe_shutdown(all_tasks):
     print("\nInitiating safe shutdown...")
     for task in all_tasks:
         if not task.done():
@@ -899,10 +502,6 @@ async def safe_shutdown(all_tasks, bm):
                 await task
             except asyncio.CancelledError:
                 pass
-    if bm is not None:
-        for conn_key in list(bm._conns.keys()):
-            await bm._stop_socket(conn_key)
-        print("WebSocket connections closed")
     global async_client
     if async_client is not None:
         await async_client.close_connection()
@@ -913,35 +512,33 @@ async def safe_shutdown(all_tasks, bm):
 async def main():
     global async_client
     print("="*60)
-    print("Binance Futures + Spot CSV Collector (Official SocketManager)")
+    print("Binance Futures + Spot CSV Collector (Polling Mode)")
     print("="*60)
 
     init_csv_file()
     async_client = await AsyncClient.create()
-    bm = BinanceSocketManager(
-        client=async_client,
-        max_queue_size=MAX_QUEUE_SIZE,
-        verbose=False
-    )
 
     all_tasks = []
     for symbol in SYMBOL_LIST:
-        symbol_tasks = await subscribe_symbol_streams(symbol, bm)
-        all_tasks.extend(symbol_tasks)
+        # 启动所有轮询任务
+        all_tasks.append(asyncio.create_task(poll_spot_klines(symbol)))
+        all_tasks.append(asyncio.create_task(poll_spot_depth(symbol)))
+        all_tasks.append(asyncio.create_task(poll_fut_klines(symbol)))
+        all_tasks.append(asyncio.create_task(poll_fut_depth(symbol)))
+        all_tasks.append(asyncio.create_task(poll_fut_mark_price(symbol)))
+        all_tasks.append(asyncio.create_task(update_open_interest(symbol)))
+        all_tasks.append(asyncio.create_task(update_long_short(symbol)))
 
-    print(f"Subscribed to {len(SYMBOL_LIST)} symbols (Futures + Spot). Collecting data...")
-    print(f"Note: Need 60 K-lines (≈15 hours) for first valid sample.")  # 修正为60
+    print(f"Started polling for {len(SYMBOL_LIST)} symbols (Futures + Spot). Collecting data...")
+    print(f"Note: Need 60 K-lines (≈15 hours) for first valid sample.")
 
     try:
         await asyncio.gather(*all_tasks)
     except KeyboardInterrupt:
-        await safe_shutdown(all_tasks, bm)
-    except BinanceWebsocketUnableToConnect as e:
-        print(f"WS connection failed: {e}")
-        await safe_shutdown(all_tasks, bm)
+        await safe_shutdown(all_tasks)
     except Exception as e:
         print(f"Unexpected error: {e}")
-        await safe_shutdown(all_tasks, bm)
+        await safe_shutdown(all_tasks)
 
 if __name__ == "__main__":
     try:
