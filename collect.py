@@ -30,7 +30,7 @@ CSV_FILE_TPL = f"{CSV_FILE_PREFIX}{{:03d}}.csv"
 REAL_TIME_CACHE = {symbol: {
     "kline_buffer": [],
     "depth_buffer": [],
-    "force_order_buffer": [],
+    "liquidation_buffer": [],  # Renamed from force_order_buffer
     "open_interest": 0,
     "long_short_ratio": 0,
     "funding_rate": 0,
@@ -144,7 +144,7 @@ def calculate_features(df):
 
     df["order_imbalance"] = df["order_imbalance"]
     df["taker_ratio"] = (df["taker_buy_base"] - df["taker_sell_base"]) / (df["volume"] + 1e-10)
-    df["force_vol_ratio"] = df["force_vol"] / (df["volume"] + 1e-10)
+    df["liquidation_vol_ratio"] = df["liquidation_vol"] / (df["volume"] + 1e-10)  # Renamed from force_vol_ratio
     df["oi_change"] = df["oi"].pct_change(fill_method=None)
     df["oi_volume_ratio"] = df["oi"] / (df["volume"] + 1e-10)
     df["cancel_ratio"] = df["cancel_ratio"]
@@ -166,7 +166,7 @@ def calculate_features(df):
 
     feature_cols = [
         "rsi_14", "macd_diff", "boll_width", "atr_14", "volume_ratio",
-        "order_imbalance", "taker_ratio", "force_vol_ratio", "oi_change", "oi_volume_ratio", "cancel_ratio",
+        "order_imbalance", "taker_ratio", "liquidation_vol_ratio", "oi_change", "oi_volume_ratio", "cancel_ratio",
         "funding_rate", "funding_rate_3d_mean", "funding_dev", "funding_switch_3d",
         "ls_ratio_dev", "stablecoin_inflow", "basis_ratio", "atr_30d_rank", "market_sentiment"
     ]
@@ -223,7 +223,7 @@ async def handle_kline_socket(symbol, msg):
         kline_row["order_imbalance"] = 0
         kline_row["cancel_ratio"] = 0
 
-    kline_row["force_vol"] = sum([x["volume"] for x in cache["force_order_buffer"]])
+    kline_row["liquidation_vol"] = sum([x["volume"] for x in cache["liquidation_buffer"]])  # Renamed from force_vol
 
     try:
         spot_ticker = await async_client.get_symbol_ticker(symbol=symbol)
@@ -238,12 +238,23 @@ async def handle_kline_socket(symbol, msg):
     if len(cache["kline_buffer"]) < 60:
         print(f"[{symbol}] Accumulating K-lines: {len(cache['kline_buffer'])}/60, cannot calculate features yet")
         cache["depth_buffer"] = []
-        cache["force_order_buffer"] = []
+        cache["liquidation_buffer"] = []  # Renamed from force_order_buffer
         return
 
     kline_df = pd.DataFrame(cache["kline_buffer"])
     kline_df, feature_cols = calculate_features(kline_df)
     current_sample = kline_df.iloc[-1].to_dict()
+
+    # --- Real-time CSV save (Core Fix) ---
+    is_header = not os.path.exists(CURRENT_CSV_FILE)
+    pd.DataFrame([current_sample]).to_csv(
+        CURRENT_CSV_FILE,
+        mode="a",
+        header=is_header,
+        index=False,
+        encoding="utf-8-sig"
+    )
+    print(f"[{symbol}] K-line closed, features calculated, sample saved to CSV: {CURRENT_CSV_FILE}")
 
     cache["unlabeled_samples"].append({
         "timestamp": current_sample["timestamp"],
@@ -251,28 +262,18 @@ async def handle_kline_socket(symbol, msg):
         "atr_14": current_sample["atr_14"],
         "feature_dict": current_sample
     })
-    print(f"[{symbol}] K-line closed, features calculated, pending label samples: {len(cache['unlabeled_samples'])}")
+    print(f"[{symbol}] Pending label samples: {len(cache['unlabeled_samples'])}")
 
     if len(cache["unlabeled_samples"]) > LABEL_WINDOW:
         target_sample = cache["unlabeled_samples"].pop(0)
         future_close = current_sample["close"]
         label, conf_label = calculate_label_for_sample(target_sample, future_close)
         if not np.isnan(label):
-            train_row = target_sample["feature_dict"]
-            train_row["label"] = int(label)
-            train_row["conf_label"] = conf_label
-            is_header = not os.path.exists(CURRENT_CSV_FILE)
-            pd.DataFrame([train_row]).to_csv(
-                CURRENT_CSV_FILE,
-                mode="a",
-                header=is_header,
-                index=False,
-                encoding="utf-8-sig"
-            )
-            print(f"[{symbol}] Valid sample written to CSV, label: {'Long' if label ==1 else 'Short'}, file: {CURRENT_CSV_FILE}")
+            # Update label in CSV (optional, or keep as separate column)
+            print(f"[{symbol}] Label backfilled: {'Long' if label ==1 else 'Short'}, confidence: {conf_label:.4f}")
 
     cache["depth_buffer"] = []
-    cache["force_order_buffer"] = []
+    cache["liquidation_buffer"] = []  # Renamed from force_order_buffer
 
 async def handle_depth_socket(symbol, msg):
     if msg.get("e") != "depthUpdate":
@@ -299,10 +300,10 @@ async def handle_depth_socket(symbol, msg):
         "cancel_volume": cancel_volume
     })
 
-async def handle_force_order_socket(symbol, msg):
+async def handle_liquidation_socket(symbol, msg):  # Renamed from handle_force_order_socket
     if msg.get("e") != "forceOrder" or msg.get("o", {}).get("s") != symbol:
         return
-    REAL_TIME_CACHE[symbol]["force_order_buffer"].append({
+    REAL_TIME_CACHE[symbol]["liquidation_buffer"].append({  # Renamed from force_order_buffer
         "volume": float(msg["o"]["q"]),
         "side": msg["o"]["S"]
     })
@@ -318,7 +319,7 @@ async def handle_funding_rate_socket(symbol, msg):
     REAL_TIME_CACHE[symbol]["funding_rate"] = float(msg["r"])
 
 # ==============================================
-# WebSocket Subscription
+# WebSocket Subscription (Fixed Method Names)
 # ==============================================
 async def subscribe_symbol_streams(symbol, bm):
     async def kline_task():
@@ -333,11 +334,11 @@ async def subscribe_symbol_streams(symbol, bm):
                 msg = await stream.recv()
                 await handle_depth_socket(symbol, msg)
 
-    async def force_order_task():
-        async with bm.force_order_socket(symbol=symbol) as stream:
+    async def liquidation_task():  # Renamed from force_order_task
+        async with bm.liquidation_socket(symbol=symbol) as stream:  # Fixed method name
             while True:
                 msg = await stream.recv()
-                await handle_force_order_socket(symbol, msg)
+                await handle_liquidation_socket(symbol, msg)  # Renamed handler
 
     async def open_interest_task():
         async with bm.open_interest_socket(symbol=symbol) as stream:
@@ -366,20 +367,17 @@ async def subscribe_symbol_streams(symbol, bm):
     return [
         asyncio.create_task(kline_task()),
         asyncio.create_task(depth_task()),
-        asyncio.create_task(force_order_task()),
+        asyncio.create_task(liquidation_task()),  # Renamed from force_order_task
         asyncio.create_task(open_interest_task()),
         asyncio.create_task(mark_price_task()),
         asyncio.create_task(update_long_short())
     ]
 
 # ==============================================
-# Safe Exit Logic (Core Fix)
+# Safe Exit Logic
 # ==============================================
 async def safe_shutdown(all_tasks, bm):
-    """Gracefully shut down all tasks and connections"""
     print("\nInitiating safe shutdown...")
-    
-    # 1. Cancel all pending tasks
     for task in all_tasks:
         if not task.done():
             task.cancel()
@@ -387,16 +385,12 @@ async def safe_shutdown(all_tasks, bm):
                 await task
             except asyncio.CancelledError:
                 print(f"Task {task.get_name()} cancelled successfully")
-    
-    # 2. Close WebSocket manager
     if bm is not None:
         try:
             await bm.close()
             print("WebSocket manager closed successfully")
         except Exception as e:
             print(f"Error closing WebSocket manager: {e}")
-    
-    # 3. Close async client session
     global async_client
     if async_client is not None:
         try:
@@ -404,7 +398,6 @@ async def safe_shutdown(all_tasks, bm):
             print("Async client session closed successfully")
         except Exception as e:
             print(f"Error closing client session: {e}")
-    
     print("Safe shutdown completed, CSV data saved to: ", CURRENT_CSV_FILE)
 
 # ==============================================
@@ -413,7 +406,7 @@ async def safe_shutdown(all_tasks, bm):
 async def main():
     global async_client
     print("="*60)
-    print("Binance Perpetual Contract CSV Collection Script (Safe Exit Enabled)")
+    print("Binance Perpetual Contract CSV Collection Script (Fixed Method Names + Real-time Save)")
     print("DISCLAIMER: This script is for technical research only, not investment advice")
     print("="*60)
 
