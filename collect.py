@@ -382,31 +382,31 @@ async def handle_funding_rate_socket(symbol, msg):
     REAL_TIME_CACHE[symbol]["funding_rate"] = float(msg["r"])
 
 async def subscribe_symbol_streams(symbol, bm):
-    """订阅标的所有实时流"""
-    # 15min K线流
-    kline_task = asyncio.create_task(bm.start_kline_socket(
+    """订阅标的所有实时流（修复方法名）"""
+    # 15min K线流（修复：start_kline_socket → kline_socket）
+    kline_task = asyncio.create_task(bm.kline_socket(
         callback=lambda msg: handle_kline_socket(symbol, msg),
         symbol=symbol,
         interval=TIMEFRAME
     ))
-    # 100ms深度流
-    depth_task = asyncio.create_task(bm.start_depth_socket(
+    # 100ms深度流（修复：start_depth_socket → depth_socket）
+    depth_task = asyncio.create_task(bm.depth_socket(
         callback=lambda msg: handle_depth_socket(symbol, msg),
         symbol=symbol,
         depth="100ms"
     ))
-    # 爆仓单流
-    force_task = asyncio.create_task(bm.start_force_order_socket(
+    # 爆仓单流（修复：start_force_order_socket → force_order_socket）
+    force_task = asyncio.create_task(bm.force_order_socket(
         callback=lambda msg: handle_force_order_socket(symbol, msg),
         symbol=symbol
     ))
-    # 未平仓量流
-    oi_task = asyncio.create_task(bm.start_open_interest_socket(
+    # 未平仓量流（修复：start_open_interest_socket → open_interest_socket）
+    oi_task = asyncio.create_task(bm.open_interest_socket(
         callback=lambda msg: handle_open_interest_socket(symbol, msg),
         symbol=symbol
     ))
-    # 资金费率流
-    funding_task = asyncio.create_task(bm.start_mark_price_socket(
+    # 资金费率流（修复：start_mark_price_socket → mark_price_socket）
+    funding_task = asyncio.create_task(bm.mark_price_socket(
         callback=lambda msg: handle_funding_rate_socket(symbol, msg),
         symbol=symbol,
         fast=False
