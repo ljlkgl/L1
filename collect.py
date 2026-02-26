@@ -1,7 +1,6 @@
 import asyncio
 import pandas as pd
 import numpy as np
-import torch
 import time
 import glob
 import os
@@ -11,14 +10,11 @@ from binance import AsyncClient, BinanceSocketManager
 from binance.exceptions import BinanceAPIException, BinanceWebsocketUnableToConnect
 
 # ==============================================
-# 【固定参数，100%匹配原方案，仅中断阈值可按需调整】
+# 【固定参数，仅保留CSV采集核心配置】
 # ==============================================
 # 核心交易配置
 SYMBOL_LIST = ["BTCUSDT", "ETHUSDT"]  # 币安官方永续合约标的
 TIMEFRAME = Client.KLINE_INTERVAL_15MINUTE  # 固定15min周期
-# 模型输入配置
-SEQ_LENGTH = 60  # 60根15minK线=15小时序列长度
-FEATURE_DIM = 20  # 固定20个输入特征
 # 标签规则（完全匹配原方案）
 LABEL_WINDOW = 3  # 未来3根K线（45分钟）打标签
 LONG_THRESHOLD = 0.005  # 收益>0.5%=做多
@@ -34,15 +30,12 @@ BOLL_PERIOD = 20
 MAX_INTERRUPT_MINUTES = 30  # 中断超过30分钟，自动新开文件
 TRAIN_FILE_PREFIX = "./perpetual_train_set"
 TRAIN_FILE_TPL = f"{TRAIN_FILE_PREFIX}_{{utc_start_time}}.csv"
-TENSOR_SAVE_PATH = "./perpetual_train_tensor.pt"
 
 # 全局实时数据缓存
 REAL_TIME_CACHE = {symbol: {
     "kline_buffer": [],
     "depth_buffer": [],
-    "trade_buffer": [],
     "force_order_buffer": [],
-    "cancel_buffer": [],
     "open_interest": 0,
     "long_short_ratio": 0,
     "funding_rate": 0,
@@ -66,12 +59,12 @@ def get_latest_train_file():
     return file_list[0]
 
 def load_existing_data(file_path):
-    """加载已有文件的历史数据，用于短中断接续，保证特征计算连续性"""
+    """加载已有文件的历史数据，用于短中断接续"""
     try:
         df = pd.read_csv(file_path)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-        # 仅保留最近1000根K线，保证指标计算准确且不占用过多内存
+        # 仅保留最近1000根K线，保证指标计算准确
         df = df.tail(1000)
         print(f"已加载历史文件：{file_path}，共{len(df)}条历史数据")
         # 转换为kline_buffer格式
@@ -97,12 +90,12 @@ def init_train_file():
     # 有历史文件，判断中断时长
     try:
         # 读取历史文件最后一行的时间
-        last_df = pd.read_csv(latest_file, nrows=0)
-        if len(last_df) == 0:
+        df_check = pd.read_csv(latest_file)
+        if len(df_check) == 0:
             file_end_time = datetime.fromtimestamp(os.path.getmtime(latest_file), tz=datetime.utcnow().tzinfo)
         else:
-            last_line = pd.read_csv(latest_file, skiprows=range(1, len(last_df)-1), nrows=1)
-            file_end_time = pd.to_datetime(last_line["timestamp"].iloc[0], utc=True)
+            last_line = df_check.iloc[-1]
+            file_end_time = pd.to_datetime(last_line["timestamp"], utc=True)
         # 计算中断时长
         interrupt_duration = (now_utc - file_end_time).total_seconds() / 60
         print(f"检测到历史文件：{latest_file}，中断时长：{interrupt_duration:.1f}分钟")
@@ -121,7 +114,7 @@ def init_train_file():
             CURRENT_TRAIN_FILE = TRAIN_FILE_TPL.format(utc_start_time=start_time_str)
             print(f"长中断，新开训练文件：{CURRENT_TRAIN_FILE}")
     except Exception as e:
-        # 任何异常，直接新开文件，保证程序正常启动
+        # 任何异常，直接新开文件
         start_time_str = now_utc.strftime("%Y%m%d_%H%M%S")
         CURRENT_TRAIN_FILE = TRAIN_FILE_TPL.format(utc_start_time=start_time_str)
         print(f"历史文件校验失败，新开训练文件：{CURRENT_TRAIN_FILE}，错误：{e}")
@@ -239,12 +232,12 @@ def calculate_label_for_sample(sample, future_close):
         return np.nan, np.abs(future_return)
 
 # ==============================================
-# 4. 币安官方Websocket实时流处理（纯实时，无历史调用）
+# 4. 币安官方Websocket实时流处理（纯实时）
 # ==============================================
 async def handle_kline_socket(symbol, msg):
     """仅处理闭合的15min K线，触发特征计算与标签回填"""
     if msg["e"] != "kline" or not msg["k"]["x"]:
-        return  # 仅处理K线闭合事件，不处理盘中数据
+        return  # 仅处理K线闭合事件
     kline_data = msg["k"]
     timestamp = pd.to_datetime(kline_data["t"], unit="ms", utc=True)
     cache = REAL_TIME_CACHE[symbol]
@@ -293,9 +286,9 @@ async def handle_kline_socket(symbol, msg):
     if len(cache["kline_buffer"]) > 1000:
         cache["kline_buffer"] = cache["kline_buffer"][-1000:]
 
-    # 检查K线数量是否足够计算特征（至少需要SEQ_LENGTH根）
-    if len(cache["kline_buffer"]) < SEQ_LENGTH:
-        print(f"[{symbol}] 积累K线中：{len(cache['kline_buffer'])}/{SEQ_LENGTH}，暂无法计算特征")
+    # 检查K线数量是否足够计算特征（至少需要60根）
+    if len(cache["kline_buffer"]) < 60:
+        print(f"[{symbol}] 积累K线中：{len(cache['kline_buffer'])}/60，暂无法计算特征")
         # 清空周期缓存
         cache["depth_buffer"] = []
         cache["force_order_buffer"] = []
@@ -321,7 +314,7 @@ async def handle_kline_socket(symbol, msg):
         future_close = current_sample["close"]
         label, conf_label = calculate_label_for_sample(target_sample, future_close)
         
-        # 有效样本写入文件
+        # 有效样本写入CSV文件
         if not np.isnan(label):
             train_row = target_sample["feature_dict"]
             train_row["label"] = int(label)
@@ -335,7 +328,7 @@ async def handle_kline_socket(symbol, msg):
                 index=False,
                 encoding="utf-8-sig"
             )
-            print(f"[{symbol}] 有效样本已写入，标签：{'做多' if label ==1 else '做空'}，文件：{CURRENT_TRAIN_FILE}")
+            print(f"[{symbol}] 有效样本已写入CSV，标签：{'做多' if label ==1 else '做空'}，文件：{CURRENT_TRAIN_FILE}")
 
     # 清空当前周期缓存
     cache["depth_buffer"] = []
@@ -389,7 +382,7 @@ async def handle_funding_rate_socket(symbol, msg):
     REAL_TIME_CACHE[symbol]["funding_rate"] = float(msg["r"])
 
 async def subscribe_symbol_streams(symbol, bm):
-    """订阅标的所有实时流，完全基于币安官方Websocket"""
+    """订阅标的所有实时流"""
     # 15min K线流
     kline_task = asyncio.create_task(bm.start_kline_socket(
         callback=lambda msg: handle_kline_socket(symbol, msg),
@@ -435,90 +428,12 @@ async def subscribe_symbol_streams(symbol, bm):
     return [kline_task, depth_task, force_task, oi_task, funding_task, ls_task]
 
 # ==============================================
-# 5. 训练张量生成（适配原方案LSTM模型）
-# ==============================================
-def build_train_tensor(merge_all_files=True):
-    """生成适配原方案模型的训练张量，支持合并所有历史文件"""
-    if merge_all_files:
-        # 合并所有符合规范的训练文件
-        file_list = glob.glob(f"{TRAIN_FILE_PREFIX}_*.csv")
-        if not file_list:
-            print("暂无训练集文件，请先运行采集脚本")
-            return
-        df_list = []
-        for file in file_list:
-            try:
-                df = pd.read_csv(file)
-                df_list.append(df)
-            except:
-                continue
-        if not df_list:
-            print("无有效训练数据")
-            return
-        full_df = pd.concat(df_list, axis=0)
-    else:
-        # 仅使用当前正在写入的文件
-        if not os.path.exists(CURRENT_TRAIN_FILE):
-            print("当前训练文件不存在")
-            return
-        full_df = pd.read_csv(CURRENT_TRAIN_FILE)
-
-    # 数据预处理
-    full_df["timestamp"] = pd.to_datetime(full_df["timestamp"], utc=True)
-    full_df = full_df.sort_values("timestamp").drop_duplicates(subset=["timestamp", "symbol"]).reset_index(drop=True)
-    feature_cols = [
-        "rsi_14", "macd_diff", "boll_width", "atr_14", "volume_ratio",
-        "order_imbalance", "taker_ratio", "force_vol_ratio", "oi_change", "oi_volume_ratio", "cancel_ratio",
-        "funding_rate", "funding_rate_3d_mean", "funding_dev", "funding_switch_3d",
-        "ls_ratio_dev", "stablecoin_inflow", "basis_ratio", "atr_30d_rank", "market_sentiment"
-    ]
-    full_df = full_df.dropna(subset=feature_cols + ["label", "conf_label"]).reset_index(drop=True)
-
-    # 滑窗构建LSTM输入
-    features = full_df[feature_cols].values
-    labels = full_df["label"].values
-    conf_labels = full_df["conf_label"].values
-
-    X, y, conf = [], [], []
-    for i in range(SEQ_LENGTH, len(features)):
-        X.append(features[i-SEQ_LENGTH:i, :])
-        y.append(labels[i])
-        conf.append(conf_labels[i])
-
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.int64)
-    conf = np.array(conf, dtype=np.float32)
-
-    # 标准化（仅用训练集，避免数据泄露）
-    train_size = int(len(X) * 0.85)
-    X_train = X[:train_size]
-    mean = X_train.mean(axis=(0, 1), keepdims=True)
-    std = X_train.std(axis=(0, 1), keepdims=True)
-    X = (X - mean) / (std + 1e-10)
-
-    # 划分数据集
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
-    conf_train, conf_test = conf[:train_size], conf[train_size:]
-
-    # 保存张量
-    torch.save({
-        "train": {"X": torch.tensor(X_train), "y": torch.tensor(y_train), "conf": torch.tensor(conf_train), "mean": mean, "std": std},
-        "test": {"X": torch.tensor(X_test), "y": torch.tensor(y_test), "conf": torch.tensor(conf_test)},
-        "feature_cols": feature_cols,
-        "seq_length": SEQ_LENGTH,
-        "feature_dim": FEATURE_DIM
-    }, TENSOR_SAVE_PATH)
-    print(f"训练张量生成完成，总样本数：{len(X)}，训练集：{len(X_train)}，测试集：{len(X_test)}")
-    print(f"输入维度：{X_train.shape}，完全适配原方案PerpetualNN模型")
-
-# ==============================================
 # 【主程序入口，一键启动】
 # ==============================================
 async def main():
     global async_client
     print("="*60)
-    print("币安永续合约纯实时训练集采集脚本")
+    print("币安永续合约纯CSV实时采集脚本（无torch依赖）")
     print("【风险提示】本脚本仅为技术研究，不构成任何投资建议")
     print("="*60)
 
@@ -535,16 +450,9 @@ async def main():
         symbol_tasks = await subscribe_symbol_streams(symbol, bm)
         all_tasks.extend(symbol_tasks)
     print(f"已启动{len(SYMBOL_LIST)}个标的的实时流订阅，正在采集数据...")
-    print(f"提示：启动后需积累{SEQ_LENGTH}根K线（约15小时）才会开始生成有效样本")
+    print(f"提示：启动后需积累60根K线（约15小时）才会开始生成有效样本")
 
-    # 4. 每日自动生成训练张量
-    async def auto_build_tensor():
-        while True:
-            await asyncio.sleep(86400)
-            build_train_tensor()
-    all_tasks.append(asyncio.create_task(auto_build_tensor()))
-
-    # 5. 异常自动重连
+    # 4. 异常自动重连
     try:
         await asyncio.gather(*all_tasks)
     except BinanceWebsocketUnableToConnect:
@@ -562,6 +470,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n程序手动停止，正在生成最新训练张量...")
-        build_train_tensor()
-        print("程序已退出")
+        print("\n程序已手动停止，CSV数据已保存至：", CURRENT_TRAIN_FILE)
