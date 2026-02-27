@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import glob
 import os
+import traceback
 from datetime import datetime
 from binance.client import Client
 from binance import AsyncClient
@@ -95,7 +96,7 @@ def init_csv_file():
         CURRENT_CSV_FILE = get_next_numeric_file()
         print(f"No existing files found, created new CSV file: {CURRENT_CSV_FILE}")
 
-# ======================== 特征计算 ========================
+# ======================== 特征计算（增加类型安全） ========================
 def calculate_rsi(prices, period):
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
@@ -121,6 +122,10 @@ def calculate_atr(high, low, close, period):
     return atr
 
 def calculate_features(df):
+    # 确保 df 是 pandas DataFrame
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
+    
     df = df.copy().sort_values("timestamp").reset_index(drop=True)
     # 期货数据列
     fut_close = df["fut_close"].values
@@ -275,37 +280,41 @@ async def handle_fut_kline_socket(symbol, msg):
         return
 
     # 6. 计算特征并写入CSV
-    fut_df = pd.DataFrame(cache["fut_kline_buffer"])
-    fut_df, feature_cols = calculate_features(fut_df)
-    current_sample = fut_df.iloc[-1].to_dict()
+    try:
+        fut_df = pd.DataFrame(cache["fut_kline_buffer"])
+        fut_df, feature_cols = calculate_features(fut_df)
+        current_sample = fut_df.iloc[-1].to_dict()
 
-    is_header = not os.path.exists(CURRENT_CSV_FILE)
-    pd.DataFrame([current_sample]).to_csv(
-        CURRENT_CSV_FILE,
-        mode="a",
-        header=is_header,
-        index=False,
-        encoding="utf-8-sig"
-    )
-    print(f"[{symbol}] Saved sample | Fut Close: {current_sample['fut_close']:.2f} | Spot Close: {current_sample['spot_close']:.2f} | Basis: {current_sample['basis']:.2f}")
+        is_header = not os.path.exists(CURRENT_CSV_FILE)
+        pd.DataFrame([current_sample]).to_csv(
+            CURRENT_CSV_FILE,
+            mode="a",
+            header=is_header,
+            index=False,
+            encoding="utf-8-sig"
+        )
+        print(f"[{symbol}] Saved sample | Fut Close: {current_sample['fut_close']:.2f} | Spot Close: {current_sample['spot_close']:.2f} | Basis: {current_sample['basis']:.2f}")
 
-    # 7. 标签回填
-    cache["unlabeled_samples"].append({
-        "timestamp": current_sample["timestamp"],
-        "fut_close": current_sample["fut_close"],
-        "atr_14": current_sample["atr_14"],
-        "feature_dict": current_sample
-    })
+        # 7. 标签回填
+        cache["unlabeled_samples"].append({
+            "timestamp": current_sample["timestamp"],
+            "fut_close": current_sample["fut_close"],
+            "atr_14": current_sample["atr_14"],
+            "feature_dict": current_sample
+        })
 
-    if len(cache["unlabeled_samples"]) > LABEL_WINDOW:
-        target_sample = cache["unlabeled_samples"].pop(0)
-        future_close = current_sample["fut_close"]
-        label, conf_label = calculate_label_for_sample(target_sample, future_close)
-        if not np.isnan(label):
-            print(f"[{symbol}] Label backfilled: {'Long' if label ==1 else 'Short'}, Conf: {conf_label:.4f}")
+        if len(cache["unlabeled_samples"]) > LABEL_WINDOW:
+            target_sample = cache["unlabeled_samples"].pop(0)
+            future_close = current_sample["fut_close"]
+            label, conf_label = calculate_label_for_sample(target_sample, future_close)
+            if not np.isnan(label):
+                print(f"[{symbol}] Label backfilled: {'Long' if label ==1 else 'Short'}, Conf: {conf_label:.4f}")
 
-    # 清空当期期货深度缓存
-    cache["fut_depth_buffer"] = []
+        # 清空当期期货深度缓存
+        cache["fut_depth_buffer"] = []
+    except Exception as e:
+        print(f"[{symbol}] Error in handle_fut_kline_socket: {e}")
+        traceback.print_exc()
 
 # ======================== 轮询任务 ========================
 async def poll_spot_klines(symbol):
@@ -400,6 +409,7 @@ async def poll_fut_klines(symbol):
                 await handle_fut_kline_socket(symbol, msg)
         except Exception as e:
             print(f"[{symbol}] Futures Kline poll error: {e}")
+            traceback.print_exc()
         await asyncio.sleep(15)
 
 async def poll_fut_depth(symbol):
@@ -518,6 +528,7 @@ async def main():
         await safe_shutdown(all_tasks)
     except Exception as e:
         print(f"Unexpected error: {e}")
+        traceback.print_exc()
         await safe_shutdown(all_tasks)
 
 if __name__ == "__main__":
