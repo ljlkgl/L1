@@ -45,7 +45,7 @@ REAL_TIME_CACHE = {symbol: {
 CURRENT_CSV_FILE = ""
 async_client = None
 
-# ======================== CSV文件管理 ========================
+# ======================== CSV文件管理（增强版本：检查现货盘口列） ========================
 def get_latest_numeric_file():
     file_list = glob.glob(f"{CSV_FILE_PREFIX}*.csv")
     if not file_list:
@@ -71,6 +71,15 @@ def get_next_numeric_file():
     current_num = int(file_name.split('.')[0])
     return CSV_FILE_TPL.format(current_num + 1)
 
+def file_has_spot_depth_columns(file_path):
+    """检查文件是否包含现货盘口列"""
+    try:
+        df = pd.read_csv(file_path, nrows=0)  # 只读取表头
+        required_cols = ["spot_order_imbalance", "spot_cancel_ratio"]
+        return all(col in df.columns for col in required_cols)
+    except:
+        return False
+
 def load_existing_data(file_path):
     try:
         df = pd.read_csv(file_path)
@@ -87,16 +96,22 @@ def init_csv_file():
     global CURRENT_CSV_FILE
     latest_file = get_latest_numeric_file()
     if latest_file:
-        CURRENT_CSV_FILE = latest_file
-        for symbol in SYMBOL_LIST:
-            history_kline = load_existing_data(latest_file)
-            REAL_TIME_CACHE[symbol]["fut_kline_buffer"] = history_kline
-        print(f"Continuing with existing CSV file: {CURRENT_CSV_FILE}")
+        # 检查是否包含现货盘口列
+        if file_has_spot_depth_columns(latest_file):
+            CURRENT_CSV_FILE = latest_file
+            for symbol in SYMBOL_LIST:
+                history_kline = load_existing_data(latest_file)
+                REAL_TIME_CACHE[symbol]["fut_kline_buffer"] = history_kline
+            print(f"Continuing with existing CSV file: {CURRENT_CSV_FILE}")
+        else:
+            # 缺少列，创建新文件
+            CURRENT_CSV_FILE = get_next_numeric_file()
+            print(f"Existing file {latest_file} lacks spot depth columns. Creating new file: {CURRENT_CSV_FILE}")
     else:
         CURRENT_CSV_FILE = get_next_numeric_file()
         print(f"No existing files found, created new CSV file: {CURRENT_CSV_FILE}")
 
-# ======================== 特征计算（修复 rolling 错误） ========================
+# ======================== 特征计算 ========================
 def calculate_rsi(prices, period):
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
@@ -172,10 +187,10 @@ def calculate_features(df):
     df["basis"] = df["fut_close"] - df["spot_close"]
     df["basis_ratio"] = df["basis"] / df["spot_close"]
     df["atr_30d_rank"] = df["atr_14"].rolling(2880, min_periods=1).rank(pct=True).fillna(0.5)
-    # 修复：使用 pandas Series 的 rolling 方法，而不是对 numpy 数组调用 rolling
+    # 市场情绪
     df["market_sentiment"] = (df["fut_close"].pct_change() > 0).astype(int).rolling(100, min_periods=1).mean().fillna(0.5)
 
-    # 20个核心特征列
+    # 20个核心特征列（不包括现货盘口，因为现货盘口是原始数据，不参与特征计算）
     feature_cols = [
         "rsi_14", "macd_diff", "boll_width", "atr_14", "volume_ratio",
         "fut_order_imbalance", "taker_ratio", "taker_volume_ratio", "oi_change", "oi_volume_ratio", "fut_cancel_ratio",
@@ -236,7 +251,7 @@ async def handle_fut_kline_socket(symbol, msg):
     spot_low = spot_latest.get("spot_low", float(kline_data["l"]))
     spot_volume = spot_latest.get("spot_volume", 0.0)
 
-    # 2. 构造期货K线行
+    # 2. 构造期货K线行（增加现货盘口字段）
     fut_kline_row = {
         "timestamp": timestamp,
         "fut_open": float(kline_data["o"]),
@@ -258,7 +273,10 @@ async def handle_fut_kline_socket(symbol, msg):
         "spot_high": spot_high,
         "spot_low": spot_low,
         "spot_close": spot_close,
-        "spot_volume": spot_volume
+        "spot_volume": spot_volume,
+        # 新增现货盘口字段
+        "spot_order_imbalance": 0.0,
+        "spot_cancel_ratio": 0.0
     }
 
     # 3. 补充期货深度指标
@@ -269,18 +287,28 @@ async def handle_fut_kline_socket(symbol, msg):
         total_cancel = fut_depth_df["fut_cancel_volume"].sum()
         fut_kline_row["fut_cancel_ratio"] = total_cancel / (total_add + 1e-10)
 
-    # 4. 更新期货K线缓存
+    # 4. 补充现货深度指标
+    if cache["spot_depth_buffer"]:
+        spot_depth_df = pd.DataFrame(cache["spot_depth_buffer"])
+        fut_kline_row["spot_order_imbalance"] = spot_depth_df["spot_order_imbalance"].mean()
+        total_add = spot_depth_df["spot_add_volume"].sum()
+        total_cancel = spot_depth_df["spot_cancel_volume"].sum()
+        fut_kline_row["spot_cancel_ratio"] = total_cancel / (total_add + 1e-10)
+
+    # 5. 更新期货K线缓存
     cache["fut_kline_buffer"].append(fut_kline_row)
     if len(cache["fut_kline_buffer"]) > 1000:
         cache["fut_kline_buffer"] = cache["fut_kline_buffer"][-1000:]
 
-    # 5. 数据量校验
+    # 6. 数据量校验
     if len(cache["fut_kline_buffer"]) < 60:
         print(f"[{symbol}] Accumulating K-lines: {len(cache['fut_kline_buffer'])}/60 (futures)")
+        # 清空本期深度缓存
         cache["fut_depth_buffer"] = []
+        cache["spot_depth_buffer"] = []
         return
 
-    # 6. 计算特征并写入CSV
+    # 7. 计算特征并写入CSV
     try:
         fut_df = pd.DataFrame(cache["fut_kline_buffer"])
         fut_df, feature_cols = calculate_features(fut_df)
@@ -296,7 +324,7 @@ async def handle_fut_kline_socket(symbol, msg):
         )
         print(f"[{symbol}] Saved sample | Fut Close: {current_sample['fut_close']:.2f} | Spot Close: {current_sample['spot_close']:.2f} | Basis: {current_sample['basis']:.2f}")
 
-        # 7. 标签回填
+        # 8. 标签回填
         cache["unlabeled_samples"].append({
             "timestamp": current_sample["timestamp"],
             "fut_close": current_sample["fut_close"],
@@ -311,8 +339,9 @@ async def handle_fut_kline_socket(symbol, msg):
             if not np.isnan(label):
                 print(f"[{symbol}] Label backfilled: {'Long' if label ==1 else 'Short'}, Conf: {conf_label:.4f}")
 
-        # 清空当期期货深度缓存
+        # 9. 清空当期深度缓存
         cache["fut_depth_buffer"] = []
+        cache["spot_depth_buffer"] = []
     except Exception as e:
         print(f"[{symbol}] Error in handle_fut_kline_socket: {e}")
         traceback.print_exc()
@@ -504,7 +533,7 @@ async def safe_shutdown(all_tasks):
 async def main():
     global async_client
     print("="*60)
-    print("Binance Futures + Spot CSV Collector (Polling Mode)")
+    print("Binance Futures + Spot CSV Collector (Polling Mode, with Spot Depth)")
     print("="*60)
 
     init_csv_file()
