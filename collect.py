@@ -240,8 +240,10 @@ async def handle_fut_kline_socket(symbol, msg):
     timestamp = pd.to_datetime(kline_data["t"], unit="ms", utc=True)
     cache = REAL_TIME_CACHE[symbol]
 
-    # 1. 获取最新现货数据（从缓存）
-    spot_latest = cache.get("spot_latest_kline", {})
+    # 1. 获取最新现货数据（从缓存），如果为 None 则用空字典
+    spot_latest = cache.get("spot_latest_kline")
+    if spot_latest is None:
+        spot_latest = {}
     spot_close = spot_latest.get("spot_close", float(kline_data["c"]))
     spot_open = spot_latest.get("spot_open", float(kline_data["o"]))
     spot_high = spot_latest.get("spot_high", float(kline_data["h"]))
