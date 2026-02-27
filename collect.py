@@ -96,7 +96,7 @@ def init_csv_file():
         CURRENT_CSV_FILE = get_next_numeric_file()
         print(f"No existing files found, created new CSV file: {CURRENT_CSV_FILE}")
 
-# ======================== 特征计算（增加类型安全） ========================
+# ======================== 特征计算（修复 rolling 错误） ========================
 def calculate_rsi(prices, period):
     deltas = np.diff(prices)
     gains = np.where(deltas > 0, deltas, 0)
@@ -172,7 +172,8 @@ def calculate_features(df):
     df["basis"] = df["fut_close"] - df["spot_close"]
     df["basis_ratio"] = df["basis"] / df["spot_close"]
     df["atr_30d_rank"] = df["atr_14"].rolling(2880, min_periods=1).rank(pct=True).fillna(0.5)
-    df["market_sentiment"] = np.where(df["fut_close"].pct_change() > 0, 1, 0).rolling(100, min_periods=1).mean().fillna(0.5)
+    # 修复：使用 pandas Series 的 rolling 方法，而不是对 numpy 数组调用 rolling
+    df["market_sentiment"] = (df["fut_close"].pct_change() > 0).astype(int).rolling(100, min_periods=1).mean().fillna(0.5)
 
     # 20个核心特征列
     feature_cols = [
@@ -197,7 +198,7 @@ def calculate_label_for_sample(sample, future_close):
     else:
         return np.nan, np.abs(future_return)
 
-# ======================== 数据处理函数（被轮询任务调用） ========================
+# ======================== 数据处理函数 ========================
 async def handle_spot_kline_socket(symbol, msg):
     """处理现货K线数据（由轮询任务调用）"""
     if msg.get("e") != "kline" or not msg.get("k", {}).get("x"):
@@ -458,9 +459,9 @@ async def poll_fut_funding_rate(symbol):
                 REAL_TIME_CACHE[symbol]["funding_rate"] = float(funding_data[0]['fundingRate'])
         except Exception as e:
             print(f"[{symbol}] Funding rate poll error: {e}")
-        await asyncio.sleep(60)  # 资金费率每小时更新，60秒轮询足够
+        await asyncio.sleep(60)
 
-# ======================== 原有轮询任务（不变） ========================
+# ======================== 原有轮询任务 ========================
 async def update_open_interest(symbol):
     while True:
         try:
