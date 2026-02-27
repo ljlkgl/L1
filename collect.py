@@ -45,7 +45,7 @@ REAL_TIME_CACHE = {symbol: {
 CURRENT_CSV_FILE = ""
 async_client = None
 
-# ======================== CSV文件管理（增强版本：检查现货盘口列） ========================
+# ======================== CSV文件管理 ========================
 def get_latest_numeric_file():
     file_list = glob.glob(f"{CSV_FILE_PREFIX}*.csv")
     if not file_list:
@@ -74,7 +74,7 @@ def get_next_numeric_file():
 def file_has_spot_depth_columns(file_path):
     """检查文件是否包含现货盘口列"""
     try:
-        df = pd.read_csv(file_path, nrows=0)  # 只读取表头
+        df = pd.read_csv(file_path, nrows=0)
         required_cols = ["spot_order_imbalance", "spot_cancel_ratio"]
         return all(col in df.columns for col in required_cols)
     except:
@@ -96,7 +96,6 @@ def init_csv_file():
     global CURRENT_CSV_FILE
     latest_file = get_latest_numeric_file()
     if latest_file:
-        # 检查是否包含现货盘口列
         if file_has_spot_depth_columns(latest_file):
             CURRENT_CSV_FILE = latest_file
             for symbol in SYMBOL_LIST:
@@ -104,7 +103,6 @@ def init_csv_file():
                 REAL_TIME_CACHE[symbol]["fut_kline_buffer"] = history_kline
             print(f"Continuing with existing CSV file: {CURRENT_CSV_FILE}")
         else:
-            # 缺少列，创建新文件
             CURRENT_CSV_FILE = get_next_numeric_file()
             print(f"Existing file {latest_file} lacks spot depth columns. Creating new file: {CURRENT_CSV_FILE}")
     else:
@@ -187,10 +185,9 @@ def calculate_features(df):
     df["basis"] = df["fut_close"] - df["spot_close"]
     df["basis_ratio"] = df["basis"] / df["spot_close"]
     df["atr_30d_rank"] = df["atr_14"].rolling(2880, min_periods=1).rank(pct=True).fillna(0.5)
-    # 市场情绪
     df["market_sentiment"] = (df["fut_close"].pct_change() > 0).astype(int).rolling(100, min_periods=1).mean().fillna(0.5)
 
-    # 20个核心特征列（不包括现货盘口，因为现货盘口是原始数据，不参与特征计算）
+    # 20个核心特征列
     feature_cols = [
         "rsi_14", "macd_diff", "boll_width", "atr_14", "volume_ratio",
         "fut_order_imbalance", "taker_ratio", "taker_volume_ratio", "oi_change", "oi_volume_ratio", "fut_cancel_ratio",
@@ -324,18 +321,19 @@ async def handle_fut_kline_socket(symbol, msg):
         )
         print(f"[{symbol}] Saved sample | Fut Close: {current_sample['fut_close']:.2f} | Spot Close: {current_sample['spot_close']:.2f} | Basis: {current_sample['basis']:.2f}")
 
-        # 8. 标签回填
+        # 8. 标签回填（使用完整样本特征）
         cache["unlabeled_samples"].append({
             "timestamp": current_sample["timestamp"],
             "fut_close": current_sample["fut_close"],
             "atr_14": current_sample["atr_14"],
-            "feature_dict": current_sample
+            "feature_dict": current_sample  # 存储完整特征供后续标签计算
         })
 
         if len(cache["unlabeled_samples"]) > LABEL_WINDOW:
             target_sample = cache["unlabeled_samples"].pop(0)
             future_close = current_sample["fut_close"]
-            label, conf_label = calculate_label_for_sample(target_sample, future_close)
+            # 正确使用 feature_dict 作为样本数据
+            label, conf_label = calculate_label_for_sample(target_sample["feature_dict"], future_close)
             if not np.isnan(label):
                 print(f"[{symbol}] Label backfilled: {'Long' if label ==1 else 'Short'}, Conf: {conf_label:.4f}")
 
